@@ -1,0 +1,26 @@
+# Vision-Reactive Pupper tunable parameters.
+# Edit these to retune gains/thresholds without touching code.
+
+approach:
+  person_class_id: 0         # COCO: 0 = person
+  min_confidence: 0.5        # drop detections below this (tau in the proposal)
+  k_yaw: 2.0                 # rad/s per unit of normalized_x (range [-0.5, 0.5])
+  yaw_deadband: 0.03         # image-fraction below which we don't yaw
+  v_max: 0.35                # m/s forward cap
+  a_slow: 20000.0            # px^2 bbox area at which we start decelerating
+  a_stop: 60000.0            # px^2 bbox area at which we fully stop
+  max_angular_z: 1.5         # rad/s safety cap
+
+tail:
+  channel: 15                # PCA9685 channel wired to the tail servo
+  f_max_hz: 2.0              # wag frequency at closest range (proposal: 2 Hz)
+  a_stop: 60000.0            # keep in sync with approach.a_stop
+  angle_min_deg: 60.0        # servo sweep lower bound
+  angle_max_deg: 120.0       # servo sweep upper bound
+  update_hz: 50.0            # servo command rate
+  pwm_freq_hz: 50            # PCA9685 frame rate (20 ms hobby servo)
+  freq_smoothing: 0.2        # EMA coefficient on target frequency
+
+runtime:
+  loop_hz: 10.0              # control loop rate; detector runs ~5 Hz
+  tail_enable_hardware: true # set false on dev machines with no PCA9685
