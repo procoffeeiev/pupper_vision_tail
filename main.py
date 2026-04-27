@@ -2,18 +2,20 @@
 """
 Vision-Reactive Pupper main loop.
 
-Subscribes to /detections (produced by hailo_detection.py), picks the highest-
-confidence person, and closes two loops:
+Subscribes to /detections (published by whichever detector bridge is active),
+picks the highest-confidence person, and closes two loops:
 
   * locomotion — ApproachController turns the bounding box into a Twist on
     /cmd_vel (yaw proportional to image-frame dx, forward speed decreasing
     with bbox area).
 
-  * tail — TailController runs a background thread that sinusoidally sweeps a
-    PCA9685 servo at a frequency that scales with bbox area.
+  * tail — once the target is close enough that forward motion has stopped,
+    TailController sends amplitude commands to the included serial servo
+    firmware. Larger boxes mean larger wag amplitude.
 
-Hardware missing (no PCA9685 attached, dev laptop, etc.) is fine — the tail
-controller drops into dry-run mode and the rest of the pipeline still runs.
+Hardware missing (no serial tail controller attached, dev laptop, etc.) is
+fine — the tail controller drops into dry-run mode and the rest of the
+pipeline still runs.
 """
 
 from __future__ import annotations
@@ -40,7 +42,6 @@ from approach_controller import ApproachConfig, ApproachController
 from tail_controller import TailConfig, TailController
 
 
-IMAGE_WIDTH = 700  # pixels — equirectangular output from hailo_detection.py
 DEFAULT_LABELS_PATH = os.path.join(os.path.dirname(__file__), "coco.txt")
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
 
@@ -56,19 +57,22 @@ class Detection:
     center_y: float
     size_x: float
     size_y: float
+    image_width: float
 
     @property
     def normalized_x(self) -> float:
-        return (self.center_x / IMAGE_WIDTH) - 0.5
+        width = max(1.0, float(self.image_width))
+        return (self.center_x / width) - 0.5
 
 
 class PupperInterface(Node):
     """ROS 2 node: subscribes to /detections, publishes /cmd_vel."""
 
-    def __init__(self, labels_path: str = DEFAULT_LABELS_PATH):
+    def __init__(self, labels_path: str = DEFAULT_LABELS_PATH, detection_image_width: float = 700.0):
         super().__init__("pupper_vision_tail_node")
 
         self._class_names = self._load_labels(labels_path)
+        self._detection_image_width = float(detection_image_width)
 
         self._lock = threading.Lock()
         self._latest: List[Detection] = []
@@ -113,6 +117,7 @@ class PupperInterface(Node):
                     center_y=float(d.bbox.center.position.y),
                     size_x=float(d.bbox.size_x),
                     size_y=float(d.bbox.size_y),
+                    image_width=self._detection_image_width,
                 )
             )
         with self._lock:
@@ -143,7 +148,11 @@ def load_configs(path: str) -> tuple[ApproachConfig, TailConfig, dict]:
     """Parse config.yaml into controller configs. Missing file → defaults."""
     approach = ApproachConfig()
     tail = TailConfig()
-    runtime = {"loop_hz": 10.0, "tail_enable_hardware": True}
+    runtime = {
+        "loop_hz": 10.0,
+        "tail_enable_hardware": True,
+        "detection_image_width": 700.0,
+    }
 
     if not Path(path).is_file():
         return approach, tail, runtime
@@ -157,7 +166,7 @@ def load_configs(path: str) -> tuple[ApproachConfig, TailConfig, dict]:
     for key, val in (data.get("tail") or {}).items():
         if hasattr(tail, key):
             setattr(tail, key, val)
-    for key in ("loop_hz", "tail_enable_hardware"):
+    for key in ("loop_hz", "tail_enable_hardware", "detection_image_width"):
         if key in (data.get("runtime") or {}):
             runtime[key] = data["runtime"][key]
 
@@ -172,7 +181,7 @@ def main():
     # Disable rclpy's default SIGINT so we can publish a zero-velocity stop
     # before tearing the context down.
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
-    node = PupperInterface()
+    node = PupperInterface(detection_image_width=runtime["detection_image_width"])
 
     executor = SingleThreadedExecutor()
     executor.add_node(node)
@@ -203,7 +212,11 @@ def main():
             if target is None:
                 tail.set_idle()
             else:
-                tail.set_from_area(target.size_x * target.size_y)
+                target_area = target.size_x * target.size_y
+                if linear_x <= 1e-3:
+                    tail.set_from_area(target_area)
+                else:
+                    tail.set_idle()
 
             node.set_velocity(linear_x=linear_x, angular_z=angular_z)
             time.sleep(loop_dt)

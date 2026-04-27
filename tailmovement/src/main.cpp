@@ -1,116 +1,134 @@
 #include <Arduino.h>
+#include <ESP32Servo.h>
 #include <math.h>
 
-// ESP32-C3 SuperMini + SG90 舵机
-// 接线：
-//   SG90 橙（信号）→ GPIO4
-//   SG90 红（VCC）  → 5V
-//   SG90 棕（GND）  → G
+// ESP32-S3 SuperMini + SG90 servo
+// Servo signal -> GPIO4
+// Feedback pin   -> GPIO1 (optional analog feedback line from the servo)
+
+namespace {
+
+Servo servo;
 
 constexpr int SERVO_PIN = 4;
-constexpr int LEDC_CHANNEL = 0;
-constexpr int LEDC_FREQ = 50;              // SG90 工作频率 50 Hz
-constexpr int LEDC_RESOLUTION = 14;        // ESP32-C3 LEDC 最大 14 位
-constexpr int PERIOD_US = 20000;           // 1/50Hz = 20ms 周期
-constexpr int MAX_DUTY = (1 << 14) - 1;    // 16383
+constexpr int FB_PIN = 1;
 
-constexpr int SERVO_MIN_PULSE_US = 1000;
-constexpr int SERVO_MAX_PULSE_US = 2000;
-constexpr int SERVO_CENTER_PULSE_US = 1500;
-constexpr float SERVO_US_PER_DEGREE = 500.0f / 90.0f;
-constexpr float CENTER_ANGLE_DEG = 90.0f;
-constexpr float DEFAULT_AMPLITUDE_DEG = 20.0f;
-constexpr float MAX_AMPLITUDE_DEG = 85.0f;
-constexpr float SINE_FREQUENCY_HZ = 1.2f;
-constexpr float SINE_PERIOD_MS = 1000.0f / SINE_FREQUENCY_HZ;
-constexpr unsigned long UPDATE_INTERVAL_MS = 10;
+constexpr int SERVO_MIN_US = 500;
+constexpr int SERVO_MAX_US = 2500;
+constexpr int SERVO_CENTER_US = 1500;
+constexpr unsigned long UPDATE_MS = 10;
 
-int pulseToDuty(int pulseUs) {
-  return (int)((long)pulseUs * MAX_DUTY / PERIOD_US);
-}
-
-void writeServoPulse(int pulseUs) {
-  int clampedPulseUs = constrain(pulseUs, SERVO_MIN_PULSE_US, SERVO_MAX_PULSE_US);
-  ledcWrite(LEDC_CHANNEL, pulseToDuty(clampedPulseUs));
-}
-
-int angleToPulseUs(float angleDeg) {
-  float centeredAngle = angleDeg - CENTER_ANGLE_DEG;
-  float pulseUs = SERVO_CENTER_PULSE_US + centeredAngle * SERVO_US_PER_DEGREE;
-  return static_cast<int>(lroundf(pulseUs));
-}
-
-void writeServoAngle(float angleDeg) {
-  float clampedAngleDeg = constrain(angleDeg, 0.0f, 180.0f);
-  writeServoPulse(angleToPulseUs(clampedAngleDeg));
-}
-
-float amplitudeDeg = DEFAULT_AMPLITUDE_DEG;
-String serialBuffer;
-unsigned long cycleStartMs = 0;
+float amplitudeUs = 0.0f;
+float wagFrequencyHz = 3.0f;
+float envelopeFrequencyHz = 0.5f;
+unsigned long watchdogTimeoutMs = 500;
+unsigned long lastCommandMs = 0;
 unsigned long lastUpdateMs = 0;
+unsigned long startMs = 0;
 
-void restartSineCycle() {
-  cycleStartMs = millis();
-  writeServoAngle(CENTER_ANGLE_DEG);
-}
+String serialBuffer;
 
-float clampAmplitude(float amplitude) {
-  if (amplitude < 0.0f) {
+float clampAmplitudeUs(float value) {
+  if (value < 0.0f) {
     return 0.0f;
   }
-  if (amplitude > MAX_AMPLITUDE_DEG) {
-    return MAX_AMPLITUDE_DEG;
+  if (value > 500.0f) {
+    return 500.0f;
   }
-  return amplitude;
+  return value;
 }
 
-void printUsage() {
-  Serial.println("Send sine amplitude in degrees over USB serial, e.g. 10 or 25");
-  Serial.print("Center angle: ");
-  Serial.print(CENTER_ANGLE_DEG, 1);
-  Serial.println(" deg");
-  Serial.print("Center pulse trim: ");
-  Serial.print(SERVO_CENTER_PULSE_US);
-  Serial.println(" us");
-  Serial.print("Valid range: 0 to ");
-  Serial.print(MAX_AMPLITUDE_DEG, 1);
-  Serial.println(" deg");
+float parseFloatToken(char *token, float fallback) {
+  if (token == nullptr) {
+    return fallback;
+  }
+  return static_cast<float>(atof(token));
 }
 
-void handleAmplitudeMessage(const String &message) {
-  String trimmed = message;
-  trimmed.trim();
+unsigned long parseUnsignedToken(char *token, unsigned long fallback) {
+  if (token == nullptr) {
+    return fallback;
+  }
+  long value = atol(token);
+  if (value < 0) {
+    return fallback;
+  }
+  return static_cast<unsigned long>(value);
+}
 
-  if (trimmed.isEmpty()) {
+void writeCentered() {
+  servo.writeMicroseconds(SERVO_CENTER_US);
+}
+
+void printStatus() {
+  int fb = analogRead(FB_PIN);
+  float fbVolts = fb * 3.3f / 4095.0f;
+  Serial.print("OK STATUS amp_us=");
+  Serial.print(amplitudeUs, 1);
+  Serial.print(" wag_hz=");
+  Serial.print(wagFrequencyHz, 3);
+  Serial.print(" env_hz=");
+  Serial.print(envelopeFrequencyHz, 3);
+  Serial.print(" timeout_ms=");
+  Serial.print(watchdogTimeoutMs);
+  Serial.print(" fb_v=");
+  Serial.println(fbVolts, 3);
+}
+
+void handleCommand(String message) {
+  message.trim();
+  if (message.isEmpty()) {
     return;
   }
 
-  float requestedAmplitude = trimmed.toFloat();
-  bool parsedZero = requestedAmplitude == 0.0f &&
-                    trimmed != "0" &&
-                    trimmed != "0.0" &&
-                    trimmed != "0.00";
-  if (parsedZero) {
-    Serial.print("Invalid amplitude: ");
-    Serial.println(trimmed);
-    printUsage();
+  char buffer[128];
+  message.toCharArray(buffer, sizeof(buffer));
+  char *token = strtok(buffer, " ");
+  if (token == nullptr) {
     return;
   }
 
-  amplitudeDeg = clampAmplitude(requestedAmplitude);
-  restartSineCycle();
-  Serial.print("Amplitude set to ");
-  Serial.print(amplitudeDeg, 1);
-  Serial.println(" deg");
+  if (strcmp(token, "STOP") == 0) {
+    amplitudeUs = 0.0f;
+    lastCommandMs = millis();
+    writeCentered();
+    return;
+  }
+
+  if (strcmp(token, "PING") == 0) {
+    Serial.println("OK PONG");
+    return;
+  }
+
+  if (strcmp(token, "STATUS") == 0) {
+    printStatus();
+    return;
+  }
+
+  if (strcmp(token, "CMD") != 0) {
+    Serial.print("ERR unknown_command ");
+    Serial.println(message);
+    return;
+  }
+
+  char *ampToken = strtok(nullptr, " ");
+  char *wagToken = strtok(nullptr, " ");
+  char *envToken = strtok(nullptr, " ");
+  char *timeoutToken = strtok(nullptr, " ");
+
+  amplitudeUs = clampAmplitudeUs(parseFloatToken(ampToken, amplitudeUs));
+  wagFrequencyHz = max(0.0f, parseFloatToken(wagToken, wagFrequencyHz));
+  envelopeFrequencyHz = max(0.0f, parseFloatToken(envToken, envelopeFrequencyHz));
+  watchdogTimeoutMs = parseUnsignedToken(timeoutToken, watchdogTimeoutMs);
+  lastCommandMs = millis();
 }
 
-void readSerialAmplitude() {
+void readSerialCommands() {
   while (Serial.available() > 0) {
     char incoming = static_cast<char>(Serial.read());
     if (incoming == '\n' || incoming == '\r') {
       if (!serialBuffer.isEmpty()) {
-        handleAmplitudeMessage(serialBuffer);
+        handleCommand(serialBuffer);
         serialBuffer = "";
       }
       continue;
@@ -119,44 +137,53 @@ void readSerialAmplitude() {
   }
 }
 
-void updateServoSine() {
-  unsigned long nowMs = millis();
-  if (nowMs - lastUpdateMs < UPDATE_INTERVAL_MS) {
+void updateServo() {
+  unsigned long now = millis();
+  if (now - lastUpdateMs < UPDATE_MS) {
     return;
   }
-  lastUpdateMs = nowMs;
+  lastUpdateMs = now;
 
-  float elapsedMs = static_cast<float>(nowMs - cycleStartMs);
-  if (elapsedMs >= SINE_PERIOD_MS) {
-    unsigned long completedPeriods = static_cast<unsigned long>(elapsedMs / SINE_PERIOD_MS);
-    cycleStartMs += static_cast<unsigned long>(lroundf(completedPeriods * SINE_PERIOD_MS));
-    writeServoAngle(CENTER_ANGLE_DEG);
-    elapsedMs = static_cast<float>(nowMs - cycleStartMs);
+  bool timedOut = watchdogTimeoutMs > 0 && (now - lastCommandMs) > watchdogTimeoutMs;
+  if (timedOut || amplitudeUs <= 0.0f || wagFrequencyHz <= 0.0f) {
+    writeCentered();
+    return;
   }
 
-  float phase = 2.0f * PI * (elapsedMs / SINE_PERIOD_MS);
-  float angleDeg = CENTER_ANGLE_DEG + amplitudeDeg * sinf(phase);
-  writeServoAngle(angleDeg);
+  float t = (now - startMs) / 1000.0f;
+  float env = 1.0f;
+  if (envelopeFrequencyHz > 0.0f) {
+    env = 0.6f + 0.4f * sinf(2.0f * PI * envelopeFrequencyHz * t);
+  }
+  float wag = sinf(2.0f * PI * wagFrequencyHz * t);
+  int pulseUs = SERVO_CENTER_US + static_cast<int>(lroundf(amplitudeUs * env * wag));
+  pulseUs = constrain(pulseUs, SERVO_MIN_US, SERVO_MAX_US);
+  servo.writeMicroseconds(pulseUs);
 }
+
+}  // namespace
 
 void setup() {
   Serial.begin(115200);
-  delay(1500);                             // 等 USB-CDC 枚举完成
+  delay(1000);
 
-  ledcSetup(LEDC_CHANNEL, LEDC_FREQ, LEDC_RESOLUTION);
-  ledcAttachPin(SERVO_PIN, LEDC_CHANNEL);
-  lastUpdateMs = 0;
+  servo.setPeriodHertz(50);
+  servo.attach(SERVO_PIN, SERVO_MIN_US, SERVO_MAX_US);
+  analogReadResolution(12);
 
-  Serial.println("Servo sine motion ready on GPIO4 (ESP32-C3 SuperMini)");
-  restartSineCycle();
+  startMs = millis();
+  lastCommandMs = millis();
+  writeCentered();
 
-  Serial.print("Default amplitude: ");
-  Serial.print(amplitudeDeg, 1);
-  Serial.println(" deg");
-  printUsage();
+  Serial.println("Tail controller ready");
+  Serial.println("Commands:");
+  Serial.println("  CMD <amp_us> <wag_hz> <env_hz> <timeout_ms>");
+  Serial.println("  STOP");
+  Serial.println("  PING");
+  Serial.println("  STATUS");
 }
 
 void loop() {
-  readSerialAmplitude();
-  updateServoSine();
+  readSerialCommands();
+  updateServo();
 }

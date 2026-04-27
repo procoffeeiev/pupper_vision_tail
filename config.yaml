@@ -7,20 +7,25 @@ approach:
   k_yaw: 2.0                 # rad/s per unit of normalized_x (range [-0.5, 0.5])
   yaw_deadband: 0.03         # image-fraction below which we don't yaw
   v_max: 0.35                # m/s forward cap
-  a_slow: 20000.0            # px^2 bbox area at which we start decelerating
-  a_stop: 60000.0            # px^2 bbox area at which we fully stop
+  a_slow: 80000.0            # px^2 bbox area at which we start decelerating
+  a_stop: 240000.0           # px^2 bbox area at which we fully stop
   max_angular_z: 1.5         # rad/s safety cap
 
 tail:
-  channel: 15                # PCA9685 channel wired to the tail servo
-  f_max_hz: 2.0              # wag frequency at closest range (proposal: 2 Hz)
-  a_stop: 60000.0            # keep in sync with approach.a_stop
-  angle_min_deg: 60.0        # servo sweep lower bound
-  angle_max_deg: 120.0       # servo sweep upper bound
-  update_hz: 50.0            # servo command rate
-  pwm_freq_hz: 50            # PCA9685 frame rate (20 ms hobby servo)
-  freq_smoothing: 0.2        # EMA coefficient on target frequency
+  serial_port: /dev/ttyACM0  # ESP32-S3 USB CDC device running tailmovement firmware
+  baudrate: 115200           # must match tailmovement/src/main.cpp
+  startup_delay_s: 2.0       # allow the MCU USB serial port to enumerate/reset
+  write_interval_s: 0.1      # serial command rate limit
+  watchdog_timeout_s: 0.5    # ESP32 centers the tail if commands stop arriving
+  wag_frequency_hz: 3.0      # matches the main wag frequency in the ESP32 firmware
+  envelope_frequency_hz: 0.5 # slow amplitude envelope for more organic motion
+  amplitude_epsilon_us: 8    # resend only after a meaningful amplitude change
+  wag_start_area: 240000.0   # start wagging once the person is at stop distance
+  wag_full_area: 360000.0    # clamp to max wag amplitude at this bbox area
+  amplitude_min_us: 80       # first nonzero wag amplitude once active
+  amplitude_max_us: 250      # largest wag amplitude sent to the ESP32
 
 runtime:
   loop_hz: 10.0              # control loop rate; detector runs ~5 Hz
-  tail_enable_hardware: true # set false on dev machines with no PCA9685
+  detection_image_width: 1400.0 # incoming RT-DETR stream width in pixels
+  tail_enable_hardware: true # set false on dev machines with no serial tail

@@ -1,23 +1,18 @@
 """
 Tail actuation for the vision-reactive Pupper.
 
-A 9 g hobby servo on a PCA9685 channel drives a cable-pull tail. A background
-thread generates a sinusoidal angle sweep whose frequency is set by the main
-loop from bounding-box area:
+The ESP32-S3 tail firmware generates the wag motion locally and accepts simple
+USB-serial commands from the robot:
 
-    f_wag = f_max * min(A / A_stop, 1)
+    CMD <amplitude_us> <wag_frequency_hz> <envelope_frequency_hz> <timeout_ms>
 
-If no person is being tracked the target frequency is 0, and the servo holds
-at the idle (center) angle.
-
-The PCA9685 import is optional — on a dev laptop the controller runs headless
-(no actual PWM output) so the rest of the pipeline can still be exercised.
+The robot side only needs to map person box area to wag amplitude and keep
+refreshing that command. If commands stop arriving, the firmware recenters the
+tail after the watchdog timeout.
 """
 
 from __future__ import annotations
 
-import math
-import threading
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -25,125 +20,124 @@ from typing import Optional
 
 @dataclass
 class TailConfig:
-    channel: int = 15             # PCA9685 channel for the tail servo
-    f_max_hz: float = 2.0         # wag rate at closest range (proposal: 2 Hz)
-    a_stop: float = 60000.0       # bbox area matching max wag (should match ApproachConfig)
-    angle_min_deg: float = 60.0   # servo sweep lower bound
-    angle_max_deg: float = 120.0  # servo sweep upper bound
-    update_hz: float = 50.0       # servo command update rate
-    pwm_freq_hz: int = 50         # PCA9685 frame rate (standard 20 ms hobby servo)
-    freq_smoothing: float = 0.2   # EMA coefficient on target frequency (0 = no smoothing)
+    serial_port: str = "/dev/ttyACM0"
+    baudrate: int = 115200
+    startup_delay_s: float = 2.0
+    write_interval_s: float = 0.1
+    watchdog_timeout_s: float = 0.5
+    wag_frequency_hz: float = 3.0
+    envelope_frequency_hz: float = 0.5
+    amplitude_epsilon_us: float = 8.0
+    wag_start_area: float = 240000.0
+    wag_full_area: float = 360000.0
+    amplitude_min_us: float = 80.0
+    amplitude_max_us: float = 250.0
 
 
 class TailController:
-    """Background servo driver with a thread-safe setpoint."""
+    """USB-serial bridge for the ESP32-S3 tail controller."""
 
     def __init__(self, config: Optional[TailConfig] = None, enable_hardware: bool = True):
         self.cfg = config or TailConfig()
-        self._lock = threading.Lock()
-        self._target_freq = 0.0       # Hz, commanded by set_from_area / set_idle
-        self._current_freq = 0.0      # Hz, smoothed, used inside the thread
-        self._phase = 0.0             # rad, accumulated so freq changes don't cause jumps
-        self._running = False
-        self._thread: Optional[threading.Thread] = None
-        self._servo = None
+        self._serial = None
         self._hw_available = False
+        self._last_write_time = 0.0
+        self._last_amplitude_us: Optional[float] = None
 
         if enable_hardware:
             self._hw_available = self._init_hardware()
 
-    # -- hardware --------------------------------------------------------
     def _init_hardware(self) -> bool:
         try:
-            from adafruit_servokit import ServoKit  # type: ignore
-        except Exception as e:  # ImportError or board-level failure
-            print(f"[tail] PCA9685/servokit unavailable ({e}); running in dry-run mode.")
+            import serial  # type: ignore
+        except Exception as e:
+            print(f"[tail] pyserial unavailable ({e}); running in dry-run mode.")
             return False
+
         try:
-            kit = ServoKit(channels=16, frequency=self.cfg.pwm_freq_hz)
-            self._servo = kit.servo[self.cfg.channel]
-            # Center at startup so we don't jolt the tail.
-            self._servo.angle = (self.cfg.angle_min_deg + self.cfg.angle_max_deg) / 2.0
+            self._serial = serial.Serial(
+                self.cfg.serial_port,
+                self.cfg.baudrate,
+                timeout=0.2,
+                write_timeout=0.2,
+            )
+            time.sleep(max(0.0, self.cfg.startup_delay_s))
+            self._write_command(0.0, force=True)
             return True
         except Exception as e:
-            print(f"[tail] ServoKit init failed ({e}); running in dry-run mode.")
-            self._servo = None
+            print(f"[tail] Serial tail init failed ({e}); running in dry-run mode.")
+            self._serial = None
             return False
 
-    # -- public API ------------------------------------------------------
     def start(self) -> None:
-        if self._running:
-            return
-        self._running = True
-        self._thread = threading.Thread(target=self._run, name="tail-wagger", daemon=True)
-        self._thread.start()
+        if self._hw_available:
+            self._write_command(0.0, force=True)
 
     def stop(self) -> None:
-        self._running = False
-        t = self._thread
-        self._thread = None
-        if t is not None:
-            t.join(timeout=1.0)
-        # Return to idle on shutdown.
-        if self._servo is not None:
+        if self._serial is not None:
             try:
-                self._servo.angle = (self.cfg.angle_min_deg + self.cfg.angle_max_deg) / 2.0
+                self._write_command(0.0, force=True)
+                self._serial.close()
             except Exception:
                 pass
+        self._serial = None
 
     def set_from_area(self, area_px2: float) -> None:
-        """Set target wag frequency from a bounding-box area."""
-        ratio = max(0.0, min(1.0, area_px2 / self.cfg.a_stop)) if self.cfg.a_stop > 0 else 0.0
-        with self._lock:
-            self._target_freq = self.cfg.f_max_hz * ratio
+        """Set wag amplitude from person box area."""
+        start = self.cfg.wag_start_area
+        full = max(start, self.cfg.wag_full_area)
+
+        if area_px2 <= start:
+            amplitude_us = 0.0
+        elif full <= start:
+            amplitude_us = self.cfg.amplitude_max_us
+        else:
+            ratio = min(1.0, (area_px2 - start) / (full - start))
+            span = self.cfg.amplitude_max_us - self.cfg.amplitude_min_us
+            amplitude_us = self.cfg.amplitude_min_us + span * ratio
+
+        self._write_command(amplitude_us)
 
     def set_idle(self) -> None:
-        """No target visible — stop wagging."""
-        with self._lock:
-            self._target_freq = 0.0
+        self._write_command(0.0)
 
     @property
     def hardware_available(self) -> bool:
         return self._hw_available
 
-    # -- background loop -------------------------------------------------
-    def _run(self) -> None:
-        dt = 1.0 / max(1.0, self.cfg.update_hz)
-        center = (self.cfg.angle_min_deg + self.cfg.angle_max_deg) / 2.0
-        half = (self.cfg.angle_max_deg - self.cfg.angle_min_deg) / 2.0
-        alpha = max(0.0, min(1.0, self.cfg.freq_smoothing))
+    def _write_command(self, amplitude_us: float, force: bool = False) -> None:
+        amplitude_us = max(0.0, min(self.cfg.amplitude_max_us, float(amplitude_us)))
+        now = time.monotonic()
+        changed = (
+            self._last_amplitude_us is None
+            or abs(amplitude_us - self._last_amplitude_us) >= self.cfg.amplitude_epsilon_us
+        )
+        due = (now - self._last_write_time) >= max(0.0, self.cfg.write_interval_s)
 
-        next_tick = time.monotonic()
-        while self._running:
-            with self._lock:
-                target = self._target_freq
+        if not force and not changed and not due:
+            return
 
-            # EMA smoothing avoids abrupt frequency jumps when A changes fast.
-            if alpha > 0.0:
-                self._current_freq += alpha * (target - self._current_freq)
-            else:
-                self._current_freq = target
+        self._last_amplitude_us = amplitude_us
+        self._last_write_time = now
 
-            f = self._current_freq
-            if f <= 1e-3:
-                angle = center
-                self._phase = 0.0
-            else:
-                self._phase += 2.0 * math.pi * f * dt
-                if self._phase > 2.0 * math.pi:
-                    self._phase -= 2.0 * math.pi
-                angle = center + half * math.sin(self._phase)
+        if self._serial is None:
+            return
 
-            if self._servo is not None:
-                try:
-                    self._servo.angle = float(angle)
-                except Exception:
-                    # Don't let a transient PWM error take down the loop.
-                    pass
+        timeout_ms = int(max(0.0, self.cfg.watchdog_timeout_s) * 1000.0)
+        line = (
+            f"CMD {amplitude_us:.1f} "
+            f"{self.cfg.wag_frequency_hz:.3f} "
+            f"{self.cfg.envelope_frequency_hz:.3f} "
+            f"{timeout_ms}\n"
+        )
 
-            next_tick += dt
-            sleep_for = next_tick - time.monotonic()
-            if sleep_for > 0:
-                time.sleep(sleep_for)
-            else:
-                next_tick = time.monotonic()
+        try:
+            self._serial.write(line.encode("ascii"))
+            self._serial.flush()
+        except Exception:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+            self._hw_available = False

@@ -1,152 +1,248 @@
-# Vision-Reactive Pupper with Motion Tail
+# Vision-Reactive Pupper
 
-Closed-loop pupper v3 behavior: detect a person, walk toward them, and wag a
-servo-driven tail faster as they get closer. Runs on a Raspberry Pi 5 with a
-Hailo NPU for detection and a PCA9685 driving a 9 g servo for the tail.
+This project makes Pupper detect a person, turn to face them, walk forward,
+stop at a configured distance, and wag its tail. The active detection path is
+remote RT-DETR: the robot streams camera frames to a laptop, the laptop runs
+RT-DETR, and the robot receives the detections back over UDP.
 
-Project proposal: *Vision-Reactive Pupper with Motion Tail*, ROB-UY 2004
-(Wang, Lin, Liang).
+The robot still handles locomotion and tail behavior locally:
 
----
+- `main.py` converts detections into `/cmd_vel`
+- the external `neural_controller` package consumes `/cmd_vel` and runs the
+  learned locomotion policy
+- `tail_controller.py` commands the ESP32-S3 tail controller over USB serial
 
-## Pipeline
+## Active Pipeline
 
-```
- camera ─▶ hailo_detection.py ─▶ /detections ─┐
-                                              ▼
-                                        main.py
-                                     (ApproachController + TailController)
-                                              │
-                    /cmd_vel ◀─────────────────┼───▶ PCA9685 servo (tail)
-```
-
-- `hailo_detection.py` — Hailo NPU YOLOv5m → `vision_msgs/Detection2DArray`
-  on `/detections`. *(Proposal specifies RT-DETR-R18; this initial pipeline
-  uses the proven Hailo YOLOv5m. RT-DETR swap is a follow-up — same output
-  contract, only this file changes.)*
-- `approach_controller.py` — visual servo: yaw from bbox x-offset, forward
-  speed that decreases linearly between `a_slow` and `a_stop`.
-- `tail_controller.py` — background thread that sinusoidally sweeps a servo
-  at a frequency scaled from bbox area.
-- `main.py` — ROS 2 node wiring everything together; publishes Twist on
-  `/cmd_vel`.
-- `config.yaml` — all tunables (gains, areas, servo limits, loop rate).
-
----
-
-## Running on the robot
-
-Two terminals. First one brings up the base stack and detector:
-
-```bash
-./scripts/system_start.sh
+```text
+robot camera -> robot_camera_stream_server.py -> MJPEG stream -> laptop RT-DETR
+                                                           |
+                                                           v
+                                       UDP person detections back to robot
+                                                           |
+                                                           v
+                                              remote_detection_bridge.py
+                                                           |
+                                                           v
+                                                       /detections
+                                                           |
+                                                           v
+                                                        main.py
+                                      +--------------------+-------------------+
+                                      |                                        |
+                                      v                                        v
+                                   /cmd_vel                               USB serial
+                                      |                                        |
+                                      v                                        v
+                           neural_controller policy                    ESP32-S3 tail servo
 ```
 
-Leave it running. In a second terminal:
+## Detection
 
-```bash
-python main.py
+The active detector is not the local Hailo node. It is the laptop RT-DETR
+stream client in `detr_person_detection/`.
+
+Current detection flow:
+
+1. `camera_ros` publishes `/camera/image_raw/compressed` on the robot.
+2. `detr_person_detection/robot_camera_stream_server.py` exposes that feed as
+   MJPEG over HTTP.
+3. A laptop runs either:
+   - `detr_person_detection/laptop_rtdetr_stream_client.py` for RT-DETR-L
+   - `detr_person_detection/laptop_rtdetr_r18_stream_client.py` for RT-DETR-R18
+4. The laptop script sends person detections back to the robot over UDP.
+5. `remote_detection_bridge.py` republishes those packets as
+   `vision_msgs/Detection2DArray` on `/detections`.
+6. `main.py` picks the best `person` detection and drives approach + tail.
+
+The older local Hailo YOLOv5m path is still in the repo as `hailo_detection.py`,
+but it is no longer the active bring-up path.
+
+## Locomotion Policy
+
+The low-level locomotion model is loaded by the external `neural_controller`
+package, but this repo now defines the active policy file location.
+
+Put your policy JSON here:
+
+```text
+models/policy_latest.json
 ```
 
-`Ctrl+C` in the `main.py` terminal publishes several zero-velocity commands
-before tearing down, and re-centers the tail servo.
+`robot.launch.py` overrides `neural_controller.model_path` to that file.
 
-### Topics
+## Tail Control
 
-| Topic | Direction | Type | Purpose |
-| --- | --- | --- | --- |
-| `/detections` | subscribed | `vision_msgs/Detection2DArray` | Per-frame detections from Hailo. |
-| `/cmd_vel` | published | `geometry_msgs/Twist` | Body-frame velocity to the neural controller. |
+The active tail firmware is the PlatformIO project in `tailmovement/`, updated
+for the ESP32-S3 + `ESP32Servo` setup.
 
-### First-time setup
+Communication is programmatic USB CDC serial, not a human serial monitor
+workflow. The robot sends commands of the form:
 
-`vision_msgs` must be installed into the robot's ROS 2 workspace:
-
-```bash
-cd /home/pi/pupperv3-monorepo/ros2_ws/src
-git clone -b jazzy https://github.com/ros-perception/vision_msgs.git
-cd /home/pi/pupperv3-monorepo/ros2_ws
-sudo rosdep init  # skip if already initialized
-rosdep update
-rosdep install --from-paths src/vision_msgs --ignore-src -r -y
-source /opt/ros/jazzy/setup.bash
-colcon build --packages-select vision_msgs vision_msgs_py --symlink-install
+```text
+CMD <amplitude_us> <wag_frequency_hz> <envelope_frequency_hz> <timeout_ms>
 ```
 
-Python extras for the tail servo:
+That is a more reasonable control path than manually typing into a serial
+monitor because:
+
+- the robot can refresh commands continuously
+- the ESP32 has a watchdog and centers the tail if commands stop
+- the wag waveform stays local to the MCU, so the robot only sends small
+  setpoint updates
+
+If you want a wireless option later, UDP over Wi-Fi from the robot to the
+ESP32 would be the next reasonable step. For a USB-tethered tail controller,
+USB CDC serial is still the most practical choice.
+
+## Repository Layout
+
+- `main.py`: robot-side control loop
+- `approach_controller.py`: maps person box offset/area to `Twist`
+- `tail_controller.py`: robot-side USB serial client for the ESP32 tail board
+- `remote_detection_bridge.py`: UDP laptop detections -> `/detections`
+- `robot.launch.py`: robot base stack + `neural_controller`
+- `config.yaml`: approach, tail, and runtime tuning
+- `scripts/system_start.sh`: robot-side bring-up
+- `models/`: place `policy_latest.json` here
+- `tailmovement/`: ESP32-S3 PlatformIO tail firmware
+- `detr_person_detection/`: laptop RT-DETR scripts and related utilities
+
+## Prerequisites
+
+- ROS 2 with the robot base stack available
+- `vision_msgs` installed in the robot ROS 2 workspace
+- a working `neural_controller` package in the robot workspace
+- `models/policy_latest.json` placed in this repo
+- an ESP32-S3 flashed with the firmware in `tailmovement/`
+- a laptop with the repo checked out to run RT-DETR
+
+Install Python dependencies on the robot:
 
 ```bash
 pip install -r requirements.txt
 ```
 
----
+If `vision_msgs` is missing:
 
-## Hardware wiring (tail)
+```bash
+cd /home/pi/pupperv3-monorepo/ros2_ws/src
+git clone -b jazzy https://github.com/ros-perception/vision_msgs.git
+cd /home/pi/pupperv3-monorepo/ros2_ws
+rosdep install --from-paths src/vision_msgs --ignore-src -r -y
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select vision_msgs vision_msgs_py --symlink-install
+```
 
-- 9 g hobby servo → PCA9685 channel **15** (override with `tail.channel` in
-  `config.yaml`).
-- PCA9685 on the Pi's I²C bus (default `/dev/i2c-1`).
-- External 5–6 V supply on the PCA9685 V+ rail — do **not** run the servo off
-  the Pi 5 V.
+## How To Use
 
-If the PCA9685 isn't present (dev laptop, unit-testing the control loop), the
-tail controller logs a warning and drops to dry-run mode — locomotion still
-works.
+### 1. Put the locomotion policy in this repo
 
----
+Place the policy file at:
+
+```text
+models/policy_latest.json
+```
+
+### 2. Flash the ESP32-S3 tail firmware
+
+Use the PlatformIO project in `tailmovement/`.
+
+Servo wiring used by the firmware:
+
+- signal -> GPIO 4
+- feedback -> GPIO 1
+- power -> 5 V
+- ground -> GND
+
+Do not power the servo directly from the Pi USB port alone.
+
+### 3. Start the robot side
+
+On the robot:
+
+```bash
+./scripts/system_start.sh
+```
+
+This starts:
+
+- `ros2 launch robot.launch.py`
+- the MJPEG camera stream server on port `8080`
+- the UDP detection bridge on port `9999`
+
+In a second terminal on the robot:
+
+```bash
+python3 main.py
+```
+
+### 4. Start the laptop RT-DETR client
+
+On the laptop, from the same repo:
+
+RT-DETR-L client dependencies:
+
+```bash
+pip install ultralytics torch opencv-python
+```
+
+RT-DETR-L:
+
+```bash
+python3 detr_person_detection/laptop_rtdetr_stream_client.py \
+  --stream-url http://<robot-ip>:8080/stream.mjpg \
+  --robot-host <robot-ip> \
+  --preview
+```
+
+RT-DETR-R18:
+
+```bash
+pip install torch opencv-python kornia
+python3 detr_person_detection/laptop_rtdetr_r18_stream_client.py \
+  --stream-url http://<robot-ip>:8080/stream.mjpg \
+  --robot-host <robot-ip> \
+  --preview
+```
+
+### 5. Behavior
+
+Once detections are flowing:
+
+- the robot yaws to center the person
+- it walks forward while the person box is small
+- it slows and stops as the box area approaches `approach.a_stop`
+- once stopped, the robot sends tail wag commands to the ESP32-S3
 
 ## Tuning
 
-All tunables live in `config.yaml`. The parameters most worth touching on
-first-run on the real robot:
+All tuning is in `config.yaml`.
 
-| Param | Start | What it controls |
-| --- | --- | --- |
-| `approach.k_yaw` | 2.0 | How hard yaw pulls toward the target. Too high → oscillation. |
-| `approach.a_slow`, `approach.a_stop` | 20k / 60k px² | Distance-proxy thresholds. Measure bbox area at 1 m and at 0.3 m and set accordingly. |
-| `approach.v_max` | 0.35 m/s | Forward speed cap. Lower while tuning. |
-| `tail.angle_min_deg`, `tail.angle_max_deg` | 60° / 120° | Tail sweep limits. Tight cable → narrow; loose → wide. |
-| `runtime.loop_hz` | 10 | Control rate. Detector runs ~5 Hz, so >10 just repeats frames. |
+Important parameters:
 
----
+- `approach.k_yaw`: yaw gain from horizontal image error
+- `approach.a_slow`: area where forward speed starts decreasing
+- `approach.a_stop`: area where forward motion stops
+- `runtime.detection_image_width`: width used to normalize horizontal box error
+- `tail.wag_start_area`: area where tail wagging begins
+- `tail.wag_full_area`: area where tail reaches max wag amplitude
+- `tail.amplitude_min_us`, `tail.amplitude_max_us`: ESP32 wag amplitude limits
+- `tail.wag_frequency_hz`: wag rate generated on the ESP32
+- `tail.envelope_frequency_hz`: slower amplitude envelope on the ESP32
 
-## Performance targets (from the proposal)
+The current defaults assume the remote RT-DETR path is using full-width camera
+frames around 1400 px wide.
 
-- Detection rate at 1 m: **DR > 0.80**
-- Approach success (2 m → <0.30 m stop): **AS > 0.70**
-- Tail response latency: **L̄ < 500 ms**
+## Topics and Ports
 
-The watchdog in `main.py` idles both locomotion and tail when no detection
-frame has arrived for >1 s.
+ROS topics:
 
----
+- `/detections`: subscribed by `main.py`
+- `/cmd_vel`: published by `main.py`
+- `/camera/image_raw/compressed`: consumed by the MJPEG stream server
 
-## Layout
+Network ports:
 
-```
-pupper_vision_tail/
-├── main.py                   # control loop (this project's novel code)
-├── approach_controller.py    # visual-servo approach
-├── tail_controller.py        # PCA9685 wag driver
-├── config.yaml               # tunable params
-├── requirements.txt
-├── hailo_detection.py        # Hailo NPU detector ROS node
-├── utils.py                  # HailoAsyncInference helpers
-├── fisheye_converter.py      # double-sphere → equirectangular unwarp
-├── camera_params.yaml        # fisheye intrinsics
-├── coco.txt                  # class labels
-├── robot.launch.py           # base-stack launch file
-├── yolov5m_wo_spp_60p.hef    # Hailo model (~35 MB)
-└── scripts/
-    └── system_start.sh       # brings up base stack + detector
-```
-
----
-
-## Follow-ups
-
-- **RT-DETR-R18 swap** — replace the Hailo YOLOv5m backbone with RT-DETR in
-  INT8. Benchmark DR & latency against the existing pipeline (Week 1 of the
-  proposal).
-- **Stretch goal** — HSV ball-tracking mode. Add a second target-picker path
-  driving the same `ApproachController`.
+- `8080`: MJPEG stream from robot to laptop
+- `9999`: UDP detections from laptop back to robot

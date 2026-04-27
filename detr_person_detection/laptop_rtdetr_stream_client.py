@@ -1,7 +1,10 @@
 import argparse
+import json
+import socket
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 import cv2
 import torch
@@ -109,6 +112,22 @@ def annotate(frame_bgr, people):
     return output
 
 
+def build_detection_packet(frame_bgr, people):
+    image_h, image_w = frame_bgr.shape[:2]
+    return {
+        "image_width": image_w,
+        "image_height": image_h,
+        "detections": [
+            {
+                "class_id": PERSON_CLASS_ID,
+                "confidence": person["confidence"],
+                "box": list(person["box"]),
+            }
+            for person in people
+        ],
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run RT-DETR locally on Pupper's streamed camera video.")
     parser.add_argument("--stream-url", default="http://10.20.19.129:8080/stream.mjpg")
@@ -117,6 +136,9 @@ def main():
     parser.add_argument("--max-frames", type=int, default=0, help="0 means run until interrupted.")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--robot-host", help="Robot IP/hostname for returning detections over UDP. Defaults to the stream host.")
+    parser.add_argument("--robot-port", type=int, default=9999)
+    parser.add_argument("--no-send", action="store_true", help="Preview only; do not send detections back to the robot.")
     parser.add_argument("--save-output", type=Path, default=PROJECT_DIR / "laptop_rtdetr_stream_detection.jpg")
     parser.add_argument("--save-raw", type=Path, default=PROJECT_DIR / "laptop_stream_latest_raw.jpg")
     args = parser.parse_args()
@@ -133,11 +155,15 @@ def main():
 
     reader = LatestFrameReader(args.stream_url)
     reader.start()
+    sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    robot_host = args.robot_host or urlparse(args.stream_url).hostname or "127.0.0.1"
     frame_index = 0
     last_annotated = None
     last_raw = None
 
     print(f"Reading stream: {args.stream_url}")
+    if not args.no_send:
+        print(f"Sending detections to udp://{robot_host}:{args.robot_port}")
     print("Press q in the preview window to quit." if args.preview else "Press Ctrl+C to stop.")
 
     try:
@@ -152,6 +178,13 @@ def main():
             people = detect_people(model, frame, args.confidence)
             elapsed = time.perf_counter() - started
             last_annotated = annotate(frame, people)
+
+            if not args.no_send:
+                packet = build_detection_packet(frame, people)
+                sender.sendto(
+                    json.dumps(packet, separators=(",", ":")).encode("utf-8"),
+                    (robot_host, args.robot_port),
+                )
 
             if people:
                 target = people[0]
@@ -179,6 +212,7 @@ def main():
         print("Stopping.")
     finally:
         reader.stop()
+        sender.close()
         if args.preview:
             cv2.destroyAllWindows()
 

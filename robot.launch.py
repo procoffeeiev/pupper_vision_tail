@@ -1,3 +1,5 @@
+import os
+
 from launch import LaunchDescription
 from launch.actions import RegisterEventHandler
 from launch.event_handlers import OnProcessExit
@@ -8,6 +10,9 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    project_dir = os.path.dirname(os.path.abspath(__file__))
+    local_policy_path = os.path.join(project_dir, "models", "policy_latest.json")
+
     # Get URDF via xacro
     robot_description_content = Command(
         [
@@ -46,7 +51,16 @@ def generate_launch_description():
     control_node = Node(
         package="controller_manager",
         executable="ros2_control_node",
-        parameters=[robot_controllers],
+        parameters=[
+            robot_controllers,
+            {
+                "neural_controller": {
+                    "ros__parameters": {
+                        "model_path": local_policy_path,
+                    }
+                }
+            },
+        ],
         output="both",
     )
 

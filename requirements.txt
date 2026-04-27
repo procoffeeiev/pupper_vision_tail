@@ -3,5 +3,4 @@
 # on the robot; pip is only for the extras used by this project's novel code.
 
 PyYAML>=6.0
-adafruit-circuitpython-servokit>=1.3
-adafruit-blinka>=8.0
+pyserial>=3.5
