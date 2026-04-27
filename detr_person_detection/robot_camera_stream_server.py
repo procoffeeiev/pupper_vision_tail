@@ -66,6 +66,7 @@ def run_picamera_source(width, height, fps, quality):
 
 def run_ros_compressed_source(topic):
     import rclpy
+    from rclpy.executors import ExternalShutdownException
     from rclpy.node import Node
     from sensor_msgs.msg import CompressedImage
 
@@ -81,9 +82,12 @@ def run_ros_compressed_source(topic):
     node = CameraSubscriber()
     try:
         rclpy.spin(node)
+    except ExternalShutdownException:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 class StreamHandler(BaseHTTPRequestHandler):

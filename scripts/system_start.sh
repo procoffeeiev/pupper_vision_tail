@@ -13,7 +13,7 @@ cd "$PROJECT_ROOT"
 
 source ~/.bashrc
 
-POLICY_PATH="$PROJECT_ROOT/models/policy_latest.json"
+POLICY_PATH="$PROJECT_ROOT/models/policy.json"
 
 if [[ "${SKIP_NEURAL_CONTROLLER_POLICY_CHECK:-0}" != "1" ]] && [[ ! -f "$POLICY_PATH" ]]; then
     echo "Missing locomotion policy: $POLICY_PATH"

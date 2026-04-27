@@ -66,7 +66,7 @@ package, but this repo now defines the active policy file location.
 Put your policy JSON here:
 
 ```text
-models/policy_latest.json
+models/policy.json
 ```
 
 `robot.launch.py` overrides `neural_controller.model_path` to that file.
@@ -104,7 +104,7 @@ USB CDC serial is still the most practical choice.
 - `robot.launch.py`: robot base stack + `neural_controller`
 - `config.yaml`: approach, tail, and runtime tuning
 - `scripts/system_start.sh`: robot-side bring-up
-- `models/`: place `policy_latest.json` here
+- `models/`: place `policy.json` here
 - `tailmovement/`: ESP32-S3 PlatformIO tail firmware
 - `detr_person_detection/`: laptop RT-DETR scripts and related utilities
 
@@ -113,7 +113,7 @@ USB CDC serial is still the most practical choice.
 - ROS 2 with the robot base stack available
 - `vision_msgs` installed in the robot ROS 2 workspace
 - a working `neural_controller` package in the robot workspace
-- `models/policy_latest.json` placed in this repo
+- `models/policy.json` placed in this repo
 - an ESP32-S3 flashed with the firmware in `tailmovement/`
 - a laptop with the repo checked out to run RT-DETR
 
@@ -141,7 +141,7 @@ colcon build --packages-select vision_msgs vision_msgs_py --symlink-install
 Place the policy file at:
 
 ```text
-models/policy_latest.json
+models/policy.json
 ```
 
 ### 2. Flash the ESP32-S3 tail firmware
@@ -196,6 +196,13 @@ python3 detr_person_detection/laptop_rtdetr_stream_client.py \
   --preview
 ```
 
+This opens a live laptop window with the Pupper camera feed, the frame
+centerline, and RT-DETR person boxes in real time.
+
+By default the RT-DETR laptop client now requires a GPU backend and will pick
+`cuda` first, then Apple `mps`. It will not silently fall back to CPU unless
+you explicitly pass `--device cpu`.
+
 RT-DETR-R18:
 
 ```bash
@@ -212,6 +219,7 @@ Once detections are flowing:
 
 - the robot yaws to center the person
 - it walks forward while the person box is small
+- if the detector is alive but no person is visible, it rotates in place to search
 - it slows and stops as the box area approaches `approach.a_stop`
 - once stopped, the robot sends tail wag commands to the ESP32-S3
 
@@ -222,6 +230,7 @@ All tuning is in `config.yaml`.
 Important parameters:
 
 - `approach.k_yaw`: yaw gain from horizontal image error
+- `approach.search_angular_z`: in-place search turn rate when no person is detected
 - `approach.a_slow`: area where forward speed starts decreasing
 - `approach.a_stop`: area where forward motion stops
 - `runtime.detection_image_width`: width used to normalize horizontal box error

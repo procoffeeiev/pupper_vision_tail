@@ -11,10 +11,13 @@ pipeline and a few related experiments.
 - `laptop_rtdetr_stream_client.py`
   - Runs on the laptop.
   - Uses RT-DETR-L from `rtdetr-l.pt`.
+  - Supports a real-time preview window with boxes and a centerline via `--preview`.
+  - Defaults to GPU execution and picks `cuda` first, then Apple `mps`.
   - Sends detections back to the robot over UDP.
 - `laptop_rtdetr_r18_stream_client.py`
   - Runs on the laptop.
   - Uses RT-DETR-R18.
+  - Defaults to GPU execution and picks `cuda` first, then Apple `mps`.
   - Sends detections back to the robot over UDP.
 
 The robot receives those UDP detections through `remote_detection_bridge.py`

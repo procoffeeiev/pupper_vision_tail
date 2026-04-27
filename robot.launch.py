@@ -11,7 +11,7 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     project_dir = os.path.dirname(os.path.abspath(__file__))
-    local_policy_path = os.path.join(project_dir, "models", "policy_latest.json")
+    local_policy_path = os.path.join(project_dir, "models", "policy.json")
 
     # Get URDF via xacro
     robot_description_content = Command(

@@ -198,6 +198,7 @@ def main():
     signal.signal(signal.SIGINT, lambda *_: stop_requested.set())
 
     loop_dt = 1.0 / max(1.0, runtime["loop_hz"])
+    last_mode = None
 
     try:
         while rclpy.ok() and not stop_requested.is_set():
@@ -207,16 +208,31 @@ def main():
             detections = node.get_detections()
             target = None if stale else approach.pick_target(detections)
 
-            linear_x, angular_z = approach.step(target)
-
-            if target is None:
+            if stale:
+                mode = "stale"
+                linear_x, angular_z = 0.0, 0.0
+                tail.set_idle()
+            elif target is None:
+                mode = "search"
+                linear_x, angular_z = approach.search_step()
                 tail.set_idle()
             else:
+                mode = "track"
+                linear_x, angular_z = approach.step(target)
                 target_area = target.size_x * target.size_y
                 if linear_x <= 1e-3:
                     tail.set_from_area(target_area)
                 else:
                     tail.set_idle()
+
+            if mode != last_mode:
+                if mode == "stale":
+                    node.get_logger().warning("Detection feed stale; stopping in place.")
+                elif mode == "search":
+                    node.get_logger().info("No person detected; rotating in place to search.")
+                else:
+                    node.get_logger().info("Person detected; tracking target.")
+                last_mode = mode
 
             node.set_velocity(linear_x=linear_x, angular_z=angular_z)
             time.sleep(loop_dt)

@@ -1,7 +1,9 @@
 __pycache__/
 *.pyc
 .DS_Store
+.venv/
 .pio/
-models/policy_latest.json
 main (4).cpp
 platformio (2).ini
+detr_person_detection/laptop_rtdetr_stream_detection.jpg
+detr_person_detection/laptop_stream_latest_raw.jpg

@@ -6,6 +6,7 @@ approach:
   min_confidence: 0.5        # drop detections below this (tau in the proposal)
   k_yaw: 2.0                 # rad/s per unit of normalized_x (range [-0.5, 0.5])
   yaw_deadband: 0.03         # image-fraction below which we don't yaw
+  search_angular_z: 0.6      # rad/s in-place search turn when detector sees no person
   v_max: 0.35                # m/s forward cap
   a_slow: 80000.0            # px^2 bbox area at which we start decelerating
   a_stop: 240000.0           # px^2 bbox area at which we fully stop

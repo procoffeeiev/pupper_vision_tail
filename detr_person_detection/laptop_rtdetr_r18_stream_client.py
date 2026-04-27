@@ -18,6 +18,30 @@ PROJECT_DIR = Path(__file__).resolve().parent
 PERSON_CLASS_ID = 0
 
 
+def resolve_device(device_arg: str) -> str:
+    if device_arg in {"gpu", "auto"}:
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        raise SystemExit(
+            "No GPU backend available for RT-DETR-R18. "
+            "Use a CUDA/MPS-capable machine or explicitly pass --device cpu."
+        )
+
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit("Requested --device cuda, but CUDA is not available.")
+        return "cuda"
+
+    if device_arg == "mps":
+        if not torch.backends.mps.is_available():
+            raise SystemExit("Requested --device mps, but Apple MPS is not available.")
+        return "mps"
+
+    return "cpu"
+
+
 class LatestFrameReader:
     def __init__(self, stream_url):
         self.stream_url = stream_url
@@ -64,8 +88,7 @@ def build_model(image_size, confidence, device):
         confidence_filtering=True,
     )
 
-    if device == "auto":
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = resolve_device(device)
 
     model = model.to(device).eval()
     return model, torch.device(device)
@@ -166,7 +189,7 @@ def main():
     parser.add_argument("--stream-url", default="http://10.20.19.129:8080/stream.mjpg")
     parser.add_argument("--confidence", type=float, default=0.35)
     parser.add_argument("--image-size", type=int, default=480)
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="cpu")
+    parser.add_argument("--device", choices=["gpu", "auto", "cuda", "mps", "cpu"], default="gpu")
     parser.add_argument("--preview", action="store_true")
     parser.add_argument("--max-frames", type=int, default=0)
     parser.add_argument("--robot-host", help="Robot IP/hostname for returning detections over UDP. Defaults to the stream host.")

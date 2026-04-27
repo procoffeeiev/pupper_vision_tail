@@ -15,6 +15,30 @@ PROJECT_DIR = Path(__file__).resolve().parent
 PERSON_CLASS_ID = 0
 
 
+def resolve_device(device_arg: str) -> str:
+    if device_arg in {"gpu", "auto"}:
+        if torch.cuda.is_available():
+            return "cuda"
+        if torch.backends.mps.is_available():
+            return "mps"
+        raise SystemExit(
+            "No GPU backend available for RT-DETR. "
+            "Use a CUDA/MPS-capable machine or explicitly pass --device cpu."
+        )
+
+    if device_arg == "cuda":
+        if not torch.cuda.is_available():
+            raise SystemExit("Requested --device cuda, but CUDA is not available.")
+        return "cuda"
+
+    if device_arg == "mps":
+        if not torch.backends.mps.is_available():
+            raise SystemExit("Requested --device mps, but Apple MPS is not available.")
+        return "mps"
+
+    return "cpu"
+
+
 class LatestFrameReader:
     def __init__(self, stream_url):
         self.stream_url = stream_url
@@ -66,6 +90,22 @@ def draw_label(image, text, x1, y1):
     )
 
 
+def draw_status_bar(image, status_text):
+    height, width = image.shape[:2]
+    top = max(0, height - 36)
+    cv2.rectangle(image, (0, top), (width, height), (20, 20, 20), -1)
+    cv2.putText(
+        image,
+        status_text,
+        (10, height - 12),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def detect_people(model, frame_bgr, confidence):
     results = model.predict(frame_bgr, conf=confidence, verbose=False)
     people = []
@@ -103,12 +143,41 @@ def detect_people(model, frame_bgr, confidence):
     return people
 
 
-def annotate(frame_bgr, people):
+def annotate(frame_bgr, people, model_name):
     output = frame_bgr.copy()
+    image_h, image_w = output.shape[:2]
+
+    cv2.line(output, (image_w // 2, 0), (image_w // 2, image_h), (255, 255, 255), 1, cv2.LINE_AA)
+
     for person in people:
         x1, y1, x2, y2 = person["box"]
         cv2.rectangle(output, (x1, y1), (x2, y2), (30, 120, 255), 3)
         draw_label(output, f"RT-DETR person {person['confidence']:.2f}", x1, y1)
+
+    if people:
+        target = people[0]
+        center_x = int(target["center"][0])
+        center_y = int(target["center"][1])
+        cv2.circle(output, (center_x, center_y), 6, (30, 120, 255), -1)
+        cv2.line(output, (image_w // 2, center_y), (center_x, center_y), (30, 120, 255), 2, cv2.LINE_AA)
+        status_text = (
+            f"{model_name} | person {target['confidence']:.2f} | "
+            f"dx {target['horizontal_error']:.3f} | area {target['area_ratio']:.3f}"
+        )
+    else:
+        cv2.putText(
+            output,
+            "NO PERSON DETECTED",
+            (20, 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255),
+            3,
+            cv2.LINE_AA,
+        )
+        status_text = f"{model_name} | searching | no person detected"
+
+    draw_status_bar(output, status_text)
     return output
 
 
@@ -135,7 +204,7 @@ def main():
     parser.add_argument("--confidence", type=float, default=0.5)
     parser.add_argument("--max-frames", type=int, default=0, help="0 means run until interrupted.")
     parser.add_argument("--preview", action="store_true")
-    parser.add_argument("--device", choices=["auto", "cpu", "mps"], default="auto")
+    parser.add_argument("--device", choices=["gpu", "auto", "cuda", "mps", "cpu"], default="gpu")
     parser.add_argument("--robot-host", help="Robot IP/hostname for returning detections over UDP. Defaults to the stream host.")
     parser.add_argument("--robot-port", type=int, default=9999)
     parser.add_argument("--no-send", action="store_true", help="Preview only; do not send detections back to the robot.")
@@ -147,9 +216,7 @@ def main():
         raise SystemExit(f"Could not find RT-DETR model: {args.model}")
 
     model = RTDETR(str(args.model))
-    device = args.device
-    if device == "auto":
-        device = "mps" if torch.backends.mps.is_available() else "cpu"
+    device = resolve_device(args.device)
     model.to(device)
     print(f"Loaded RT-DETR model on {device}.")
 
@@ -177,7 +244,7 @@ def main():
             started = time.perf_counter()
             people = detect_people(model, frame, args.confidence)
             elapsed = time.perf_counter() - started
-            last_annotated = annotate(frame, people)
+            last_annotated = annotate(frame, people, args.model.name)
 
             if not args.no_send:
                 packet = build_detection_packet(frame, people)
