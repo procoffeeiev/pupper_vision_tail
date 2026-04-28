@@ -103,7 +103,8 @@ USB CDC serial is still the most practical choice.
 - `remote_detection_bridge.py`: UDP laptop detections -> `/detections`
 - `robot.launch.py`: robot base stack + `neural_controller`
 - `config.yaml`: approach, tail, and runtime tuning
-- `scripts/system_start.sh`: robot-side bring-up
+- `scripts/pi_control.sh`: robot-side foreground runner with clean Ctrl+C shutdown
+- `scripts/laptop_control.sh`: laptop-side foreground RT-DETR preview runner
 - `models/`: place `policy.json` here
 - `tailmovement/`: ESP32-S3 PlatformIO tail firmware
 - `detr_person_detection/`: laptop RT-DETR scripts and related utilities
@@ -162,7 +163,7 @@ Do not power the servo directly from the Pi USB port alone.
 On the robot:
 
 ```bash
-./scripts/system_start.sh
+./scripts/pi_control.sh
 ```
 
 This starts:
@@ -170,12 +171,9 @@ This starts:
 - `ros2 launch robot.launch.py`
 - the MJPEG camera stream server on port `8080`
 - the UDP detection bridge on port `9999`
+- `main.py`
 
-In a second terminal on the robot:
-
-```bash
-python3 main.py
-```
+Press `Ctrl+C` in that terminal to stop the whole robot-side stack cleanly.
 
 ### 4. Start the laptop RT-DETR client
 
@@ -190,10 +188,9 @@ pip install ultralytics torch opencv-python
 RT-DETR-L:
 
 ```bash
-python3 detr_person_detection/laptop_rtdetr_stream_client.py \
-  --stream-url http://<robot-ip>:8080/stream.mjpg \
-  --robot-host <robot-ip> \
-  --preview
+STREAM_URL=http://<robot-ip>:8080/stream.mjpg \
+ROBOT_HOST=<robot-ip> \
+./scripts/laptop_control.sh
 ```
 
 This opens a live laptop window with the Pupper camera feed, the frame
@@ -203,11 +200,12 @@ By default the RT-DETR laptop client now requires a GPU backend and will pick
 `cuda` first, then Apple `mps`. It will not silently fall back to CPU unless
 you explicitly pass `--device cpu`.
 
-RT-DETR-R18:
+Press `Ctrl+C` in that terminal to stop the laptop detector cleanly.
+
+If you want to run the client directly instead of the wrapper:
 
 ```bash
-pip install torch opencv-python kornia
-python3 detr_person_detection/laptop_rtdetr_r18_stream_client.py \
+python3 detr_person_detection/laptop_rtdetr_stream_client.py \
   --stream-url http://<robot-ip>:8080/stream.mjpg \
   --robot-host <robot-ip> \
   --preview

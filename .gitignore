@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 .venv/
 .pio/
+.run/
 main (4).cpp
 platformio (2).ini
 detr_person_detection/laptop_rtdetr_stream_detection.jpg
