@@ -1,4 +1,5 @@
 import argparse
+import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +35,12 @@ class FrameStore:
 
 
 FRAME_STORE = FrameStore()
+STOP_EVENT = threading.Event()
+
+
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 def run_picamera_source(width, height, fps, quality):
@@ -50,7 +57,7 @@ def run_picamera_source(width, height, fps, quality):
 
     delay = 1.0 / max(fps, 1)
     try:
-        while True:
+        while not STOP_EVENT.is_set():
             frame_rgb = camera.capture_array()
             ok, encoded = cv2.imencode(
                 ".jpg",
@@ -81,7 +88,8 @@ def run_ros_compressed_source(topic):
     rclpy.init()
     node = CameraSubscriber()
     try:
-        rclpy.spin(node)
+        while rclpy.ok() and not STOP_EVENT.is_set():
+            rclpy.spin_once(node, timeout_sec=0.1)
     except ExternalShutdownException:
         pass
     finally:
@@ -127,7 +135,7 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             count = -1
-            while True:
+            while not STOP_EVENT.is_set():
                 jpeg, count, _ = FRAME_STORE.wait_next(count)
                 if jpeg is None:
                     continue
@@ -165,13 +173,25 @@ def main():
     else:
         source = threading.Thread(target=run_ros_compressed_source, args=(args.topic,), daemon=True)
 
-    source.start()
+    server = ReusableThreadingHTTPServer((args.host, args.port), StreamHandler)
 
-    server = ThreadingHTTPServer((args.host, args.port), StreamHandler)
+    def request_shutdown(*_args):
+        STOP_EVENT.set()
+        server.shutdown()
+
+    signal.signal(signal.SIGINT, request_shutdown)
+    signal.signal(signal.SIGTERM, request_shutdown)
+
+    source.start()
     print(f"Serving Pupper camera stream at http://{args.host}:{args.port}/stream.mjpg")
     print(f"Snapshot endpoint: http://{args.host}:{args.port}/snapshot.jpg")
     print(f"Source: {args.source}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        STOP_EVENT.set()
+        server.server_close()
+        source.join(timeout=2.0)
 
 
 if __name__ == "__main__":

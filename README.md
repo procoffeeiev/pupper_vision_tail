@@ -174,6 +174,9 @@ This starts:
 - `main.py`
 
 Press `Ctrl+C` in that terminal to stop the whole robot-side stack cleanly.
+The script also kills stale leftover processes from previous runs before it
+launches, and it waits until the camera stream is actually serving frames
+before declaring the stack ready.
 
 ### 4. Start the laptop RT-DETR client
 
@@ -201,6 +204,10 @@ By default the RT-DETR laptop client now requires a GPU backend and will pick
 you explicitly pass `--device cpu`.
 
 Press `Ctrl+C` in that terminal to stop the laptop detector cleanly.
+The laptop script waits for the robot MJPEG stream to become reachable before
+starting RT-DETR, so it is safe to launch the two scripts back-to-back in
+separate terminals. The RT-DETR client also reconnects automatically if the
+MJPEG stream stalls during a restart.
 
 If you want to run the client directly instead of the wrapper:
 

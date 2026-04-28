@@ -44,6 +44,7 @@ class LatestFrameReader:
         self.stream_url = stream_url
         self.lock = threading.Lock()
         self.frame = None
+        self.last_frame_time = 0.0
         self.stopped = False
         self.thread = threading.Thread(target=self._run, daemon=True)
 
@@ -58,22 +59,40 @@ class LatestFrameReader:
         with self.lock:
             return None if self.frame is None else self.frame.copy()
 
+    def age_seconds(self):
+        with self.lock:
+            if self.last_frame_time <= 0.0:
+                return float("inf")
+            return time.time() - self.last_frame_time
+
     def _run(self):
-        cap = cv2.VideoCapture(self.stream_url)
-        if not cap.isOpened():
-            print(f"Could not open stream: {self.stream_url}")
-            self.stopped = True
-            return
-
         while not self.stopped:
-            ok, frame = cap.read()
-            if not ok or frame is None:
-                time.sleep(0.02)
+            cap = cv2.VideoCapture(self.stream_url)
+            if not cap.isOpened():
+                print(f"Could not open stream: {self.stream_url}; retrying...")
+                time.sleep(1.0)
                 continue
-            with self.lock:
-                self.frame = frame
 
-        cap.release()
+            print(f"Connected to stream: {self.stream_url}")
+            failed_reads = 0
+            while not self.stopped:
+                ok, frame = cap.read()
+                if not ok or frame is None:
+                    failed_reads += 1
+                    if failed_reads >= 20:
+                        print("Stream stalled; reconnecting...")
+                        break
+                    time.sleep(0.05)
+                    continue
+
+                failed_reads = 0
+                with self.lock:
+                    self.frame = frame
+                    self.last_frame_time = time.time()
+
+            cap.release()
+            if not self.stopped:
+                time.sleep(0.5)
 
 
 def draw_label(image, text, x1, y1):
@@ -236,7 +255,7 @@ def main():
     try:
         while True:
             frame = reader.get()
-            if frame is None:
+            if frame is None or reader.age_seconds() > 2.0:
                 time.sleep(0.02)
                 continue
 
