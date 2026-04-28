@@ -18,9 +18,33 @@ if [[ ! -f "$MODEL_PATH" ]]; then
     exit 1
 fi
 
+wait_for_url() {
+    local url="$1"
+    local timeout_s="$2"
+    local start_ts
+    start_ts="$(date +%s)"
+
+    while true; do
+        if python3 -c 'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).read(1)' "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if (( "$(date +%s)" - start_ts >= timeout_s )); then
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
 PYTHON_BIN="python3"
 if [[ -x "$PROJECT_ROOT/.venv/bin/python" ]]; then
     PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+fi
+
+echo "waiting for robot camera stream..."
+if ! wait_for_url "$STREAM_URL" 60; then
+    echo "camera stream did not become reachable in time: $STREAM_URL"
+    exit 1
 fi
 
 echo "laptop RT-DETR preview running"

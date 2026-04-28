@@ -15,6 +15,32 @@ if [[ ! -f "$POLICY_PATH" ]]; then
     exit 1
 fi
 
+wait_for_url() {
+    local url="$1"
+    local timeout_s="$2"
+    local start_ts
+    start_ts="$(date +%s)"
+
+    while true; do
+        if python3 -c 'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=2).read(1)' "$url" >/dev/null 2>&1; then
+            return 0
+        fi
+
+        if (( "$(date +%s)" - start_ts >= timeout_s )); then
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
+kill_stale() {
+    pkill -f "$PROJECT_ROOT/main.py" 2>/dev/null || true
+    pkill -f "$PROJECT_ROOT/remote_detection_bridge.py" 2>/dev/null || true
+    pkill -f "$PROJECT_ROOT/detr_person_detection/robot_camera_stream_server.py" 2>/dev/null || true
+    pkill -f "ros2 launch $PROJECT_ROOT/robot.launch.py" 2>/dev/null || true
+    sleep 1
+}
+
 ROS2_PID=""
 STREAM_PID=""
 BRIDGE_PID=""
@@ -44,6 +70,8 @@ cleanup() {
 
 trap cleanup INT TERM EXIT
 
+kill_stale
+
 ros2 launch "$PROJECT_ROOT/robot.launch.py" &
 ROS2_PID=$!
 
@@ -62,7 +90,13 @@ BRIDGE_PID=$!
 python3 "$PROJECT_ROOT/main.py" &
 MAIN_PID=$!
 
+if ! wait_for_url "http://127.0.0.1:8080/snapshot.jpg" 30; then
+    echo "camera stream did not become ready in time"
+    exit 1
+fi
+
 echo "robot-side stack running"
 echo "Ctrl+C stops ros2 launch, camera stream, detection bridge, and main.py cleanly"
+echo "camera stream ready at http://127.0.0.1:8080/stream.mjpg"
 
 wait "$MAIN_PID"
