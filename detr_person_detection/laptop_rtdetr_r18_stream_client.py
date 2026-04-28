@@ -4,9 +4,12 @@ import socket
 import threading
 import time
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
 import cv2
+import numpy as np
 import torch
 from kornia.contrib.models.rt_detr import DETRPostProcessor
 from kornia.models.detection import ObjectDetector
@@ -70,30 +73,55 @@ class LatestFrameReader:
 
     def _run(self):
         while not self.stopped:
-            cap = cv2.VideoCapture(self.stream_url)
-            if not cap.isOpened():
-                print(f"Could not open stream: {self.stream_url}; retrying...")
+            request = Request(self.stream_url, headers={"User-Agent": "pupper-vision-tail"})
+            try:
+                response = urlopen(request, timeout=5.0)
+            except (URLError, TimeoutError, OSError) as exc:
+                print(f"Could not open stream: {self.stream_url} ({exc}); retrying...")
                 time.sleep(1.0)
                 continue
 
             print(f"Connected to stream: {self.stream_url}")
-            failed_reads = 0
-            while not self.stopped:
-                ok, frame = cap.read()
-                if not ok or frame is None:
-                    failed_reads += 1
-                    if failed_reads >= 20:
+            buffer = bytearray()
+            try:
+                while not self.stopped:
+                    chunk = response.read(4096)
+                    if not chunk:
                         print("Stream stalled; reconnecting...")
                         break
-                    time.sleep(0.05)
-                    continue
 
-                failed_reads = 0
-                with self.lock:
-                    self.frame = frame
-                    self.last_frame_time = time.time()
+                    buffer.extend(chunk)
+                    while True:
+                        start = buffer.find(b"\xff\xd8")
+                        if start < 0:
+                            if len(buffer) > 2:
+                                del buffer[:-2]
+                            break
 
-            cap.release()
+                        end = buffer.find(b"\xff\xd9", start + 2)
+                        if end < 0:
+                            if start > 0:
+                                del buffer[:start]
+                            break
+
+                        jpeg = bytes(buffer[start:end + 2])
+                        del buffer[:end + 2]
+
+                        frame = cv2.imdecode(np.frombuffer(jpeg, dtype=np.uint8), cv2.IMREAD_COLOR)
+                        if frame is None:
+                            continue
+
+                        with self.lock:
+                            self.frame = frame
+                            self.last_frame_time = time.time()
+            except Exception as exc:
+                if not self.stopped:
+                    print(f"Stream read failed ({exc}); reconnecting...")
+            finally:
+                try:
+                    response.close()
+                except Exception:
+                    pass
             if not self.stopped:
                 time.sleep(0.5)
 
