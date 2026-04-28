@@ -234,7 +234,8 @@ All tuning is in `config.yaml`.
 
 Important parameters:
 
-- `approach.k_yaw`: yaw gain from horizontal image error
+- `approach.k_yaw`: yaw gain from fisheye-corrected target azimuth
+- `approach.yaw_deadband_rad`: ignore tiny yaw errors around the optical center
 - `approach.search_angular_z`: in-place search turn rate when no person is detected
 - `approach.a_slow`: area where forward speed starts decreasing
 - `approach.a_stop`: area where forward motion stops

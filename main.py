@@ -20,6 +20,7 @@ pipeline still runs.
 
 from __future__ import annotations
 
+import math
 import os
 import signal
 import threading
@@ -39,11 +40,13 @@ from geometry_msgs.msg import Twist
 from vision_msgs.msg import Detection2DArray
 
 from approach_controller import ApproachConfig, ApproachController
+from fisheye_converter import load_camera_model
 from tail_controller import TailConfig, TailController
 
 
 DEFAULT_LABELS_PATH = os.path.join(os.path.dirname(__file__), "coco.txt")
 DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.yaml")
+DEFAULT_CAMERA_PARAMS_PATH = os.path.join(os.path.dirname(__file__), "camera_params.yaml")
 
 DETECTION_WATCHDOG_S = 1.0  # stop if no frames for this long
 
@@ -58,6 +61,7 @@ class Detection:
     size_x: float
     size_y: float
     image_width: float
+    yaw_error_rad: float
 
     @property
     def normalized_x(self) -> float:
@@ -68,11 +72,29 @@ class Detection:
 class PupperInterface(Node):
     """ROS 2 node: subscribes to /detections, publishes /cmd_vel."""
 
-    def __init__(self, labels_path: str = DEFAULT_LABELS_PATH, detection_image_width: float = 700.0):
+    def __init__(
+        self,
+        labels_path: str = DEFAULT_LABELS_PATH,
+        detection_image_width: float = 700.0,
+        detection_image_height: float = 525.0,
+        camera_params_path: str = DEFAULT_CAMERA_PARAMS_PATH,
+    ):
         super().__init__("pupper_vision_tail_node")
 
         self._class_names = self._load_labels(labels_path)
         self._detection_image_width = float(detection_image_width)
+        self._detection_image_height = float(detection_image_height)
+        self._camera_model = None
+        if Path(camera_params_path).is_file():
+            try:
+                self._camera_model = load_camera_model(
+                    camera_params_path,
+                    int(self._detection_image_width),
+                    int(self._detection_image_height),
+                )
+                self.get_logger().info("Using fisheye camera model for yaw-angle mapping.")
+            except Exception as exc:
+                self.get_logger().warning(f"Failed to load camera model; using linear yaw mapping ({exc})")
 
         self._lock = threading.Lock()
         self._latest: List[Detection] = []
@@ -98,6 +120,18 @@ class PupperInterface(Node):
             return self._class_names[class_id]
         return str(class_id)
 
+    def _yaw_error_from_pixel(self, center_x: float, center_y: float) -> float:
+        if self._camera_model is None:
+            width = max(1.0, self._detection_image_width)
+            return ((center_x / width) - 0.5) * 2.0
+
+        ray_x, _, ray_z, valid = self._camera_model.unproject(center_x, center_y)
+        valid_value = bool(valid) if not hasattr(valid, "shape") else bool(valid.all())
+        if not valid_value:
+            width = max(1.0, self._detection_image_width)
+            return ((center_x / width) - 0.5) * 2.0
+        return float(math.atan2(float(ray_x), float(ray_z)))
+
     def _detection_cb(self, msg: Detection2DArray) -> None:
         dets: List[Detection] = []
         for d in msg.detections:
@@ -108,16 +142,19 @@ class PupperInterface(Node):
                 class_id = int(hyp.hypothesis.class_id)
             except ValueError:
                 class_id = -1
+            center_x = float(d.bbox.center.position.x)
+            center_y = float(d.bbox.center.position.y)
             dets.append(
                 Detection(
                     class_id=class_id,
                     class_name=self._name(class_id),
                     confidence=float(hyp.hypothesis.score),
-                    center_x=float(d.bbox.center.position.x),
-                    center_y=float(d.bbox.center.position.y),
+                    center_x=center_x,
+                    center_y=center_y,
                     size_x=float(d.bbox.size_x),
                     size_y=float(d.bbox.size_y),
                     image_width=self._detection_image_width,
+                    yaw_error_rad=self._yaw_error_from_pixel(center_x, center_y),
                 )
             )
         with self._lock:
@@ -152,6 +189,7 @@ def load_configs(path: str) -> tuple[ApproachConfig, TailConfig, dict]:
         "loop_hz": 10.0,
         "tail_enable_hardware": True,
         "detection_image_width": 700.0,
+        "detection_image_height": 525.0,
     }
 
     if not Path(path).is_file():
@@ -166,7 +204,7 @@ def load_configs(path: str) -> tuple[ApproachConfig, TailConfig, dict]:
     for key, val in (data.get("tail") or {}).items():
         if hasattr(tail, key):
             setattr(tail, key, val)
-    for key in ("loop_hz", "tail_enable_hardware", "detection_image_width"):
+    for key in ("loop_hz", "tail_enable_hardware", "detection_image_width", "detection_image_height"):
         if key in (data.get("runtime") or {}):
             runtime[key] = data["runtime"][key]
 
@@ -181,7 +219,10 @@ def main():
     # Disable rclpy's default SIGINT so we can publish a zero-velocity stop
     # before tearing the context down.
     rclpy.init(signal_handler_options=SignalHandlerOptions.NO)
-    node = PupperInterface(detection_image_width=runtime["detection_image_width"])
+    node = PupperInterface(
+        detection_image_width=runtime["detection_image_width"],
+        detection_image_height=runtime["detection_image_height"],
+    )
 
     executor = SingleThreadedExecutor()
     executor.add_node(node)

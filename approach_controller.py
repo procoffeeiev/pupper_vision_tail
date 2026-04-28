@@ -4,13 +4,13 @@ Visual-servoing approach controller.
 Turns a single Detection (bounding box + confidence) into a body-frame
 velocity command. Follows the mapping described in the project proposal:
 
-    yaw rate:  psi_dot  = -k_yaw * dx        (dx = center_x_norm in [-0.5, 0.5])
+    yaw rate:  psi_dot  = -k_yaw * yaw_error_rad
     forward :  v_x = v_max                         when A < A_slow
                v_x = v_max * (A_stop - A) /       when A_slow <= A < A_stop
                             (A_stop - A_slow)
                v_x = 0                             when A >= A_stop
 
-A small deadband on dx prevents twitching when the target is near-centered.
+A small deadband on yaw error prevents twitching when the target is near-centered.
 """
 
 from dataclasses import dataclass
@@ -24,14 +24,16 @@ class _DetectionLike(Protocol):
     size_y: float
     @property
     def normalized_x(self) -> float: ...
+    @property
+    def yaw_error_rad(self) -> float: ...
 
 
 @dataclass
 class ApproachConfig:
     person_class_id: int = 0      # COCO: 0 = person
     min_confidence: float = 0.5   # tau in the proposal
-    k_yaw: float = 2.0            # rad/s per unit of normalized_x (range [-0.5, 0.5])
-    yaw_deadband: float = 0.03    # ignore |dx| smaller than this
+    k_yaw: float = 2.0            # rad/s per rad of yaw error
+    yaw_deadband_rad: float = 0.05 # ignore |yaw_error| smaller than this
     search_angular_z: float = 0.6 # rad/s in-place search turn when no person is visible
     v_max: float = 0.35           # m/s forward cap
     a_slow: float = 20000.0       # bbox area (px^2) at which we start decelerating
@@ -61,11 +63,11 @@ class ApproachController:
         if target is None:
             return 0.0, 0.0
 
-        dx = target.normalized_x
-        if abs(dx) < self.cfg.yaw_deadband:
+        yaw_error = target.yaw_error_rad
+        if abs(yaw_error) < self.cfg.yaw_deadband_rad:
             angular_z = 0.0
         else:
-            angular_z = -self.cfg.k_yaw * dx
+            angular_z = -self.cfg.k_yaw * yaw_error
             # clamp for safety
             cap = self.cfg.max_angular_z
             angular_z = max(-cap, min(cap, angular_z))

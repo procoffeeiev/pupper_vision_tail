@@ -36,6 +36,35 @@ class DoubleSphereModel:
 
         return u, v, valid
 
+    def unproject(self, u, v, eps=1e-9):
+        """Map image pixels back to unit rays with the double-sphere model."""
+        mx = (u - self.cx) / self.fx
+        my = (v - self.cy) / self.fy
+        r2 = mx * mx + my * my
+
+        discriminant = 1.0 - (2.0 * self.alpha - 1.0) * r2
+        valid = discriminant >= 0.0
+        discriminant = np.maximum(discriminant, eps)
+
+        mz_num = 1.0 - self.alpha * self.alpha * r2
+        mz_den = self.alpha * np.sqrt(discriminant) + (1.0 - self.alpha)
+        mz = mz_num / np.maximum(mz_den, eps)
+
+        k_num = mz * self.xi + np.sqrt(mz * mz + (1.0 - self.xi * self.xi) * r2)
+        k_den = mz * mz + r2
+        k = k_num / np.maximum(k_den, eps)
+
+        x = k * mx
+        y = k * my
+        z = k * mz - self.xi
+
+        norm = np.sqrt(x * x + y * y + z * z)
+        x /= np.maximum(norm, eps)
+        y /= np.maximum(norm, eps)
+        z /= np.maximum(norm, eps)
+
+        return x, y, z, valid
+
 
 def create_equirectangular_rays(width, height, h_fov_deg=220.0):
     """Generate 3D rays for equirectangular projection"""
@@ -94,6 +123,5 @@ def load_camera_model(config_path, img_width, img_height):
         width=img_width,
         height=img_height,
     )
-
 
 

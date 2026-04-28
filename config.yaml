@@ -4,8 +4,8 @@
 approach:
   person_class_id: 0         # COCO: 0 = person
   min_confidence: 0.5        # drop detections below this (tau in the proposal)
-  k_yaw: 2.0                 # rad/s per unit of normalized_x (range [-0.5, 0.5])
-  yaw_deadband: 0.03         # image-fraction below which we don't yaw
+  k_yaw: 2.0                 # rad/s per rad of fisheye-corrected yaw error
+  yaw_deadband_rad: 0.05     # ignore tiny yaw errors near image center
   search_angular_z: 0.6      # rad/s in-place search turn when detector sees no person
   v_max: 0.35                # m/s forward cap
   a_slow: 80000.0            # px^2 bbox area at which we start decelerating
@@ -29,4 +29,5 @@ tail:
 runtime:
   loop_hz: 10.0              # control loop rate; detector runs ~5 Hz
   detection_image_width: 1400.0 # incoming RT-DETR stream width in pixels
+  detection_image_height: 1050.0 # incoming RT-DETR stream height in pixels
   tail_enable_hardware: true # set false on dev machines with no serial tail
