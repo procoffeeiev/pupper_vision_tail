@@ -77,6 +77,9 @@ class LatestFrameReader:
             try:
                 response = urlopen(request, timeout=5.0)
             except (URLError, TimeoutError, OSError) as exc:
+                with self.lock:
+                    self.frame = None
+                    self.last_frame_time = 0.0
                 print(f"Could not open stream: {self.stream_url} ({exc}); retrying...")
                 time.sleep(1.0)
                 continue
@@ -87,6 +90,9 @@ class LatestFrameReader:
                 while not self.stopped:
                     chunk = response.read(4096)
                     if not chunk:
+                        with self.lock:
+                            self.frame = None
+                            self.last_frame_time = 0.0
                         print("Stream stalled; reconnecting...")
                         break
 
@@ -116,6 +122,9 @@ class LatestFrameReader:
                             self.last_frame_time = time.time()
             except Exception as exc:
                 if not self.stopped:
+                    with self.lock:
+                        self.frame = None
+                        self.last_frame_time = 0.0
                     print(f"Stream read failed ({exc}); reconnecting...")
             finally:
                 try:
@@ -124,6 +133,21 @@ class LatestFrameReader:
                     pass
             if not self.stopped:
                 time.sleep(0.5)
+
+
+def draw_waiting_frame(width=960, height=540, text="Waiting for camera stream..."):
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+    cv2.putText(
+        image,
+        text,
+        (40, height // 2),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        1.0,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    return image
 
 
 def build_model(image_size, confidence, device):
@@ -268,6 +292,11 @@ def main():
         while True:
             frame = reader.get()
             if frame is None or reader.age_seconds() > 2.0:
+                if args.preview:
+                    waiting = draw_waiting_frame(text="Reconnecting to Pupper camera stream...")
+                    cv2.imshow("Pupper stream RT-DETR-R18", waiting)
+                    if cv2.waitKey(1) & 0xFF == ord("q"):
+                        break
                 time.sleep(0.02)
                 continue
 
