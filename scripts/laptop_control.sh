@@ -10,8 +10,15 @@ STREAM_URL="${STREAM_URL:-http://10.20.19.129:8080/stream.mjpg}"
 ROBOT_HOST="${ROBOT_HOST:-10.20.19.129}"
 MODEL_PATH="${MODEL_PATH:-$PROJECT_ROOT/detr_person_detection/rtdetr-l.pt}"
 DEVICE="${DEVICE:-gpu}"
+SESSION_ID="${SESSION_ID:-pvt_$(date -u +%Y%m%dT%H%M%SZ)}"
+TRIAL_ID="${TRIAL_ID:-}"
+EXPERIMENT_LOG_DIR="${EXPERIMENT_LOG_DIR:-$PROJECT_ROOT/data/experiments}"
+CONDITION_DISTANCE_M="${CONDITION_DISTANCE_M:-}"
+GROUND_TRUTH_PERSON_PRESENT="${GROUND_TRUTH_PERSON_PRESENT:-unknown}"
+MAX_FRAMES="${MAX_FRAMES:-0}"
 
 cd "$PROJECT_ROOT"
+mkdir -p "$EXPERIMENT_LOG_DIR"
 
 if [[ ! -f "$MODEL_PATH" ]]; then
     echo "Missing RT-DETR model: $MODEL_PATH"
@@ -51,6 +58,9 @@ echo "laptop RT-DETR preview running"
 echo "stream: $STREAM_URL"
 echo "robot: $ROBOT_HOST"
 echo "device: $DEVICE"
+echo "session: $SESSION_ID"
+echo "trial: ${TRIAL_ID:-<unset>}"
+echo "experiment logs: $EXPERIMENT_LOG_DIR"
 echo "Ctrl+C stops the detector cleanly"
 
 exec "$PYTHON_BIN" "$PROJECT_ROOT/detr_person_detection/laptop_rtdetr_stream_client.py" \
@@ -58,4 +68,10 @@ exec "$PYTHON_BIN" "$PROJECT_ROOT/detr_person_detection/laptop_rtdetr_stream_cli
     --robot-host "$ROBOT_HOST" \
     --model "$MODEL_PATH" \
     --device "$DEVICE" \
+    --session-id "$SESSION_ID" \
+    --trial-id "$TRIAL_ID" \
+    --log-dir "$EXPERIMENT_LOG_DIR" \
+    --condition-distance-m "$CONDITION_DISTANCE_M" \
+    --ground-truth-person-present "$GROUND_TRUTH_PERSON_PRESENT" \
+    --max-frames "$MAX_FRAMES" \
     --preview

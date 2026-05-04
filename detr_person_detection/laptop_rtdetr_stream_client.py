@@ -1,6 +1,8 @@
 import argparse
+import os
 import json
 import socket
+import sys
 import threading
 import time
 from pathlib import Path
@@ -15,6 +17,12 @@ from ultralytics import RTDETR
 
 
 PROJECT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = PROJECT_DIR.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from experiment_logging import build_logger, target_fields  # noqa: E402
+
 PERSON_CLASS_ID = 0
 
 
@@ -43,8 +51,9 @@ def resolve_device(device_arg: str) -> str:
 
 
 class LatestFrameReader:
-    def __init__(self, stream_url):
+    def __init__(self, stream_url, event_logger=None):
         self.stream_url = stream_url
+        self.event_logger = event_logger
         self.lock = threading.Lock()
         self.frame = None
         self.last_frame_time = 0.0
@@ -77,12 +86,17 @@ class LatestFrameReader:
                 with self.lock:
                     self.frame = None
                     self.last_frame_time = 0.0
+                if self.event_logger is not None:
+                    self.event_logger.log("stream_connect_failed", stream_url=self.stream_url, notes=str(exc))
                 print(f"Could not open stream: {self.stream_url} ({exc}); retrying...")
                 time.sleep(1.0)
                 continue
 
             print(f"Connected to stream: {self.stream_url}")
+            if self.event_logger is not None:
+                self.event_logger.log("stream_connect", stream_url=self.stream_url)
             buffer = bytearray()
+            disconnect_reason = "reader_stop"
             try:
                 while not self.stopped:
                     chunk = response.read(4096)
@@ -90,6 +104,7 @@ class LatestFrameReader:
                         with self.lock:
                             self.frame = None
                             self.last_frame_time = 0.0
+                        disconnect_reason = "empty_chunk"
                         print("Stream stalled; reconnecting...")
                         break
 
@@ -123,8 +138,11 @@ class LatestFrameReader:
                     with self.lock:
                         self.frame = None
                         self.last_frame_time = 0.0
+                    disconnect_reason = str(exc)
                     print(f"Stream read failed ({exc}); reconnecting...")
             finally:
+                if self.event_logger is not None:
+                    self.event_logger.log("stream_disconnect", stream_url=self.stream_url, notes=disconnect_reason)
                 try:
                     response.close()
                 except Exception:
@@ -203,6 +221,7 @@ def detect_people(model, frame_bgr, confidence):
 
             people.append(
                 {
+                    "class_id": PERSON_CLASS_ID,
                     "confidence": score,
                     "box": (x1, y1, x2, y2),
                     "center": (center_x, center_y),
@@ -253,9 +272,26 @@ def annotate(frame_bgr, people, model_name):
     return output
 
 
-def build_detection_packet(frame_bgr, people):
+def build_detection_packet(
+    frame_bgr,
+    people,
+    *,
+    frame_index=None,
+    session_id="",
+    trial_id="",
+    model_name="",
+    device="",
+    inference_time_s=None,
+):
     image_h, image_w = frame_bgr.shape[:2]
     return {
+        "session_id": session_id,
+        "trial_id": trial_id,
+        "frame_index": frame_index,
+        "model": model_name,
+        "device": device,
+        "sent_unix_s": time.time(),
+        "inference_time_s": inference_time_s,
         "image_width": image_w,
         "image_height": image_h,
         "detections": [
@@ -282,23 +318,62 @@ def main():
     parser.add_argument("--no-send", action="store_true", help="Preview only; do not send detections back to the robot.")
     parser.add_argument("--save-output", type=Path, default=PROJECT_DIR / "laptop_rtdetr_stream_detection.jpg")
     parser.add_argument("--save-raw", type=Path, default=PROJECT_DIR / "laptop_stream_latest_raw.jpg")
+    parser.add_argument("--session-id", default=os.environ.get("SESSION_ID"))
+    parser.add_argument("--trial-id", default=os.environ.get("TRIAL_ID", ""))
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path(os.environ.get("EXPERIMENT_LOG_DIR", ROOT_DIR / "data" / "experiments")),
+    )
+    parser.add_argument("--csv-log", type=Path, default=None)
+    parser.add_argument(
+        "--condition-distance-m",
+        default=os.environ.get("CONDITION_DISTANCE_M", ""),
+        help="Ground-truth person distance for detection trials, if known.",
+    )
+    parser.add_argument(
+        "--ground-truth-person-present",
+        choices=["true", "false", "unknown"],
+        default=os.environ.get("GROUND_TRUTH_PERSON_PRESENT", "unknown"),
+    )
     args = parser.parse_args()
 
     if not args.model.exists():
         raise SystemExit(f"Could not find RT-DETR model: {args.model}")
 
+    robot_host = args.robot_host or urlparse(args.stream_url).hostname or "127.0.0.1"
+    logger = build_logger(
+        side="laptop",
+        component="rtdetr_l",
+        session_id=args.session_id,
+        trial_id=args.trial_id,
+        log_dir=args.log_dir,
+        csv_log=args.csv_log,
+    )
+    logger.log(
+        "laptop_client_start",
+        stream_url=args.stream_url,
+        robot_host=robot_host,
+        robot_port=args.robot_port,
+        model=args.model.name,
+        condition_distance_m=args.condition_distance_m,
+        ground_truth_person_present=args.ground_truth_person_present,
+        notes=f"csv_log={logger.path}",
+    )
+
     model = RTDETR(str(args.model))
     device = resolve_device(args.device)
     model.to(device)
     print(f"Loaded RT-DETR model on {device}.")
+    logger.log("model_loaded", model=args.model.name, device=device)
 
-    reader = LatestFrameReader(args.stream_url)
+    reader = LatestFrameReader(args.stream_url, event_logger=logger)
     reader.start()
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    robot_host = args.robot_host or urlparse(args.stream_url).hostname or "127.0.0.1"
     frame_index = 0
     last_annotated = None
     last_raw = None
+    stop_reason = "normal"
 
     print(f"Reading stream: {args.stream_url}")
     if not args.no_send:
@@ -323,12 +398,45 @@ def main():
             elapsed = time.perf_counter() - started
             last_annotated = annotate(frame, people, args.model.name)
 
+            packet_bytes = ""
             if not args.no_send:
-                packet = build_detection_packet(frame, people)
+                packet = build_detection_packet(
+                    frame,
+                    people,
+                    frame_index=frame_index,
+                    session_id=logger.session_id,
+                    trial_id=args.trial_id,
+                    model_name=args.model.name,
+                    device=device,
+                    inference_time_s=elapsed,
+                )
+                payload = json.dumps(packet, separators=(",", ":")).encode("utf-8")
                 sender.sendto(
-                    json.dumps(packet, separators=(",", ":")).encode("utf-8"),
+                    payload,
                     (robot_host, args.robot_port),
                 )
+                packet_bytes = len(payload)
+
+            image_h, image_w = frame.shape[:2]
+            log_fields = target_fields(people[0] if people else None, image_w, image_h)
+            logger.log(
+                "detection_frame",
+                frame_index=frame_index,
+                stream_url=args.stream_url,
+                robot_host=robot_host,
+                robot_port=args.robot_port,
+                model=args.model.name,
+                device=device,
+                image_width=image_w,
+                image_height=image_h,
+                detections_count=len(people),
+                inference_time_s=elapsed,
+                frame_age_s=reader.age_seconds(),
+                packet_bytes=packet_bytes,
+                condition_distance_m=args.condition_distance_m,
+                ground_truth_person_present=args.ground_truth_person_present,
+                **log_fields,
+            )
 
             if people:
                 target = people[0]
@@ -353,12 +461,15 @@ def main():
                 break
 
     except KeyboardInterrupt:
+        stop_reason = "keyboard_interrupt"
         print("Stopping.")
     finally:
         reader.stop()
         sender.close()
         if args.preview:
             cv2.destroyAllWindows()
+        logger.log("laptop_client_stop", frame_index=frame_index, notes=stop_reason)
+        logger.close()
 
     if last_raw is not None:
         args.save_raw.parent.mkdir(parents=True, exist_ok=True)

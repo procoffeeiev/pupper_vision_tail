@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import os
+import argparse
 import signal
 import threading
 import time
@@ -40,6 +41,7 @@ from geometry_msgs.msg import Twist
 from vision_msgs.msg import Detection2DArray
 
 from approach_controller import ApproachConfig, ApproachController
+from experiment_logging import build_logger
 from fisheye_converter import load_camera_model
 from tail_controller import TailConfig, TailController
 
@@ -61,6 +63,7 @@ class Detection:
     size_x: float
     size_y: float
     image_width: float
+    image_height: float
     yaw_error_rad: float
 
     @property
@@ -154,6 +157,7 @@ class PupperInterface(Node):
                     size_x=float(d.bbox.size_x),
                     size_y=float(d.bbox.size_y),
                     image_width=self._detection_image_width,
+                    image_height=self._detection_image_height,
                     yaw_error_rad=self._yaw_error_from_pixel(center_x, center_y),
                 )
             )
@@ -179,6 +183,25 @@ class PupperInterface(Node):
         cmd.linear.y = float(linear_y)
         cmd.angular.z = float(angular_z)
         self._cmd_pub.publish(cmd)
+
+
+def detection_log_fields(target: Optional[Detection]) -> dict:
+    if target is None:
+        return {"target_detected": False}
+
+    area = float(target.size_x) * float(target.size_y)
+    frame_area = max(1.0, float(target.image_width) * float(target.image_height))
+    return {
+        "target_detected": True,
+        "target_confidence": target.confidence,
+        "target_class_id": target.class_id,
+        "target_center_x": target.center_x,
+        "target_center_y": target.center_y,
+        "target_area_px2": area,
+        "target_area_ratio": area / frame_area,
+        "horizontal_error": target.normalized_x * 2.0,
+        "yaw_error_rad": target.yaw_error_rad,
+    }
 
 
 def load_configs(path: str) -> tuple[ApproachConfig, TailConfig, dict]:
@@ -212,9 +235,35 @@ def load_configs(path: str) -> tuple[ApproachConfig, TailConfig, dict]:
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--session-id", default=os.environ.get("SESSION_ID"))
+    parser.add_argument("--trial-id", default=os.environ.get("TRIAL_ID", ""))
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path(os.environ.get("EXPERIMENT_LOG_DIR", Path(__file__).resolve().parent / "data" / "experiments")),
+    )
+    parser.add_argument("--csv-log", type=Path, default=None)
+    parser.add_argument("--condition-distance-m", default=os.environ.get("CONDITION_DISTANCE_M", ""))
+    parser.add_argument("--final-distance-m", default=os.environ.get("FINAL_DISTANCE_M", ""))
+    parser.add_argument(
+        "--ground-truth-person-present",
+        choices=["true", "false", "unknown"],
+        default=os.environ.get("GROUND_TRUTH_PERSON_PRESENT", "unknown"),
+    )
+    args = parser.parse_args()
+
+    logger = build_logger(
+        side="pupper",
+        component="control_loop",
+        session_id=args.session_id,
+        trial_id=args.trial_id,
+        log_dir=args.log_dir,
+        csv_log=args.csv_log,
+    )
     approach_cfg, tail_cfg, runtime = load_configs(DEFAULT_CONFIG_PATH)
     approach = ApproachController(approach_cfg)
-    tail = TailController(tail_cfg, enable_hardware=runtime["tail_enable_hardware"])
+    tail = TailController(tail_cfg, enable_hardware=runtime["tail_enable_hardware"], event_logger=logger)
 
     # Disable rclpy's default SIGINT so we can publish a zero-velocity stop
     # before tearing the context down.
@@ -234,37 +283,53 @@ def main():
         f"Started. Tail hardware: {'enabled' if tail.hardware_available else 'dry-run'}. "
         f"Loop {runtime['loop_hz']:.1f} Hz."
     )
+    logger.log(
+        "control_loop_start",
+        image_width=runtime["detection_image_width"],
+        image_height=runtime["detection_image_height"],
+        tail_hw_available=tail.hardware_available,
+        condition_distance_m=args.condition_distance_m,
+        ground_truth_person_present=args.ground_truth_person_present,
+        notes=f"loop_hz={runtime['loop_hz']}; csv_log={logger.path}",
+    )
 
     stop_requested = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop_requested.set())
 
     loop_dt = 1.0 / max(1.0, runtime["loop_hz"])
     last_mode = None
+    tail_active = False
+    approach_active = False
+    approach_start_time = None
+    loop_index = 0
 
     try:
         while rclpy.ok() and not stop_requested.is_set():
             # Watchdog: if detection feed has gone silent, stop and idle the tail.
-            stale = node.seconds_since_last_detection() > DETECTION_WATCHDOG_S
+            frame_age_s = node.seconds_since_last_detection()
+            stale = frame_age_s > DETECTION_WATCHDOG_S
 
             detections = node.get_detections()
             target = None if stale else approach.pick_target(detections)
+            target_area = 0.0
+            tail_amplitude_us = 0.0
 
             if stale:
                 mode = "stale"
                 linear_x, angular_z = 0.0, 0.0
-                tail.set_idle()
+                tail_amplitude_us = tail.set_idle()
             elif target is None:
                 mode = "search"
                 linear_x, angular_z = approach.search_step()
-                tail.set_idle()
+                tail_amplitude_us = tail.set_idle()
             else:
                 mode = "track"
                 linear_x, angular_z = approach.step(target)
                 target_area = target.size_x * target.size_y
                 if linear_x <= 1e-3:
-                    tail.set_from_area(target_area)
+                    tail_amplitude_us = tail.set_from_area(target_area)
                 else:
-                    tail.set_idle()
+                    tail_amplitude_us = tail.set_idle()
 
             if mode != last_mode:
                 if mode == "stale":
@@ -273,9 +338,119 @@ def main():
                     node.get_logger().info("No person detected; rotating in place to search.")
                 else:
                     node.get_logger().info("Person detected; tracking target.")
+                logger.log(
+                    "mode_change",
+                    mode=mode,
+                    stale=stale,
+                    frame_age_s=frame_age_s,
+                    detections_count=len(detections),
+                    tail_amplitude_us=tail_amplitude_us,
+                    tail_hw_available=tail.hardware_available,
+                    condition_distance_m=args.condition_distance_m,
+                    ground_truth_person_present=args.ground_truth_person_present,
+                    **detection_log_fields(target),
+                )
                 last_mode = mode
 
+            if (
+                mode == "track"
+                and target is not None
+                and linear_x > 1e-3
+                and not approach_active
+            ):
+                approach_start_time = time.monotonic()
+                approach_active = True
+                logger.log(
+                    "approach_start",
+                    mode=mode,
+                    stale=stale,
+                    frame_age_s=frame_age_s,
+                    detections_count=len(detections),
+                    linear_x=linear_x,
+                    angular_z=angular_z,
+                    tail_amplitude_us=tail_amplitude_us,
+                    tail_hw_available=tail.hardware_available,
+                    condition_distance_m=args.condition_distance_m,
+                    ground_truth_person_present=args.ground_truth_person_present,
+                    **detection_log_fields(target),
+                )
+
+            if (
+                mode == "track"
+                and target is not None
+                and linear_x <= 1e-3
+                and approach_active
+            ):
+                duration = ""
+                if approach_start_time is not None:
+                    duration = time.monotonic() - approach_start_time
+                logger.log(
+                    "approach_stop",
+                    mode=mode,
+                    stale=stale,
+                    frame_age_s=frame_age_s,
+                    detections_count=len(detections),
+                    linear_x=linear_x,
+                    angular_z=angular_z,
+                    tail_amplitude_us=tail_amplitude_us,
+                    tail_hw_available=tail.hardware_available,
+                    condition_distance_m=args.condition_distance_m,
+                    ground_truth_person_present=args.ground_truth_person_present,
+                    approach_duration_s=duration,
+                    **detection_log_fields(target),
+                )
+                approach_active = False
+                approach_start_time = None
+
+            now_tail_active = tail_amplitude_us > 0.0
+            if now_tail_active and not tail_active:
+                logger.log(
+                    "tail_wag_start",
+                    mode=mode,
+                    stale=stale,
+                    frame_age_s=frame_age_s,
+                    detections_count=len(detections),
+                    linear_x=linear_x,
+                    angular_z=angular_z,
+                    tail_amplitude_us=tail_amplitude_us,
+                    tail_hw_available=tail.hardware_available,
+                    condition_distance_m=args.condition_distance_m,
+                    ground_truth_person_present=args.ground_truth_person_present,
+                    **detection_log_fields(target),
+                )
+            elif tail_active and not now_tail_active:
+                logger.log(
+                    "tail_wag_stop",
+                    mode=mode,
+                    stale=stale,
+                    frame_age_s=frame_age_s,
+                    detections_count=len(detections),
+                    tail_amplitude_us=tail_amplitude_us,
+                    tail_hw_available=tail.hardware_available,
+                    condition_distance_m=args.condition_distance_m,
+                    ground_truth_person_present=args.ground_truth_person_present,
+                    **detection_log_fields(target),
+                )
+            tail_active = now_tail_active
+
+            logger.log(
+                "control_sample",
+                frame_index=loop_index,
+                mode=mode,
+                stale=stale,
+                frame_age_s=frame_age_s,
+                detections_count=len(detections),
+                linear_x=linear_x,
+                angular_z=angular_z,
+                tail_amplitude_us=tail_amplitude_us,
+                tail_hw_available=tail.hardware_available,
+                condition_distance_m=args.condition_distance_m,
+                ground_truth_person_present=args.ground_truth_person_present,
+                **detection_log_fields(target),
+            )
+
             node.set_velocity(linear_x=linear_x, angular_z=angular_z)
+            loop_index += 1
             time.sleep(loop_dt)
 
     except Exception as e:
@@ -286,11 +461,18 @@ def main():
             node.set_velocity(0.0, 0.0, 0.0)
             time.sleep(0.1)
         tail.stop()
+        logger.log(
+            "control_loop_stop",
+            frame_index=loop_index,
+            final_distance_m=args.final_distance_m,
+            tail_hw_available=tail.hardware_available,
+        )
         executor.shutdown()
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
         spin_thread.join(timeout=1.0)
+        logger.close()
 
 
 if __name__ == "__main__":

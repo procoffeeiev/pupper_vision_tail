@@ -249,6 +249,30 @@ Important parameters:
 The current defaults assume the remote RT-DETR path is using full-width camera
 frames around 1400 px wide.
 
+## Experiment Logging
+
+Runtime CSV logs are written under:
+
+```text
+data/experiments/
+```
+
+Set the same `SESSION_ID` on the robot and laptop to join their logs:
+
+```bash
+SESSION_ID=approach_eval_001 TRIAL_ID=trial_01 ./scripts/pi_control.sh
+SESSION_ID=approach_eval_001 TRIAL_ID=trial_01 ./scripts/laptop_control.sh
+```
+
+The logs include laptop stream connect/disconnect events, Pupper stream-client
+connect/disconnect events, UDP peer connect/disconnect events, per-frame
+detections, control-loop samples, and tail command events. See
+`Experiment_Design.md` for the evaluation protocol and metric definitions. For
+approach trials, use `scripts/record_trial_result.py` after measuring the final
+distance manually. After collecting a session, run
+`scripts/summarize_experiment.py --session-id <id>` to generate slide-ready
+metrics.
+
 ## Topics and Ports
 
 ROS topics:

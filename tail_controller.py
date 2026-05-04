@@ -37,8 +37,9 @@ class TailConfig:
 class TailController:
     """USB-serial bridge for the ESP32-S3 tail controller."""
 
-    def __init__(self, config: Optional[TailConfig] = None, enable_hardware: bool = True):
+    def __init__(self, config: Optional[TailConfig] = None, enable_hardware: bool = True, event_logger=None):
         self.cfg = config or TailConfig()
+        self._event_logger = event_logger
         self._serial = None
         self._hw_available = False
         self._last_write_time = 0.0
@@ -52,6 +53,8 @@ class TailController:
             import serial  # type: ignore
         except Exception as e:
             print(f"[tail] pyserial unavailable ({e}); running in dry-run mode.")
+            if self._event_logger is not None:
+                self._event_logger.log("tail_serial_unavailable", notes=str(e))
             return False
 
         try:
@@ -63,10 +66,14 @@ class TailController:
             )
             time.sleep(max(0.0, self.cfg.startup_delay_s))
             self._write_command(0.0, force=True)
+            if self._event_logger is not None:
+                self._event_logger.log("tail_serial_connect", notes=f"port={self.cfg.serial_port}; baudrate={self.cfg.baudrate}")
             return True
         except Exception as e:
             print(f"[tail] Serial tail init failed ({e}); running in dry-run mode.")
             self._serial = None
+            if self._event_logger is not None:
+                self._event_logger.log("tail_serial_connect_failed", notes=str(e))
             return False
 
     def start(self) -> None:
@@ -78,11 +85,13 @@ class TailController:
             try:
                 self._write_command(0.0, force=True)
                 self._serial.close()
+                if self._event_logger is not None:
+                    self._event_logger.log("tail_serial_disconnect", notes="closed")
             except Exception:
                 pass
         self._serial = None
 
-    def set_from_area(self, area_px2: float) -> None:
+    def set_from_area(self, area_px2: float) -> float:
         """Set wag amplitude from person box area."""
         start = self.cfg.wag_start_area
         full = max(start, self.cfg.wag_full_area)
@@ -97,9 +106,11 @@ class TailController:
             amplitude_us = self.cfg.amplitude_min_us + span * ratio
 
         self._write_command(amplitude_us)
+        return amplitude_us
 
-    def set_idle(self) -> None:
+    def set_idle(self) -> float:
         self._write_command(0.0)
+        return 0.0
 
     @property
     def hardware_available(self) -> bool:
@@ -134,6 +145,13 @@ class TailController:
         try:
             self._serial.write(line.encode("ascii"))
             self._serial.flush()
+            if self._event_logger is not None:
+                self._event_logger.log(
+                    "tail_command_sent",
+                    tail_amplitude_us=amplitude_us,
+                    tail_hw_available=self._hw_available,
+                    notes=f"wag_hz={self.cfg.wag_frequency_hz:.3f}; env_hz={self.cfg.envelope_frequency_hz:.3f}; timeout_ms={timeout_ms}",
+                )
         except Exception:
             try:
                 self._serial.close()
@@ -141,3 +159,5 @@ class TailController:
                 pass
             self._serial = None
             self._hw_available = False
+            if self._event_logger is not None:
+                self._event_logger.log("tail_serial_disconnect", tail_amplitude_us=amplitude_us, notes="write_failed")

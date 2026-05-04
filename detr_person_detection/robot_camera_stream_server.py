@@ -1,8 +1,19 @@
 import argparse
+import os
 import signal
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+
+PROJECT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = PROJECT_DIR.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from experiment_logging import build_logger  # noqa: E402
 
 
 class FrameStore:
@@ -36,6 +47,7 @@ class FrameStore:
 
 FRAME_STORE = FrameStore()
 STOP_EVENT = threading.Event()
+EVENT_LOGGER = None
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -127,6 +139,9 @@ class StreamHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/stream.mjpg":
+            peer = f"{self.client_address[0]}:{self.client_address[1]}"
+            if EVENT_LOGGER is not None:
+                EVENT_LOGGER.log("stream_client_connect", peer=peer, stream_url=self.path)
             self.send_response(200)
             self.send_header("Age", "0")
             self.send_header("Cache-Control", "no-cache, private")
@@ -135,6 +150,7 @@ class StreamHandler(BaseHTTPRequestHandler):
             self.end_headers()
 
             count = -1
+            disconnect_reason = "server_stop"
             while not STOP_EVENT.is_set():
                 jpeg, count, _ = FRAME_STORE.wait_next(count)
                 if jpeg is None:
@@ -146,13 +162,24 @@ class StreamHandler(BaseHTTPRequestHandler):
                     self.wfile.write(jpeg)
                     self.wfile.write(b"\r\n")
                 except (BrokenPipeError, ConnectionResetError):
+                    disconnect_reason = "client_disconnect"
                     break
+            if EVENT_LOGGER is not None:
+                EVENT_LOGGER.log(
+                    "stream_client_disconnect",
+                    peer=peer,
+                    stream_url=self.path,
+                    frame_index=count,
+                    notes=disconnect_reason,
+                )
             return
 
         self.send_error(404)
 
 
 def main():
+    global EVENT_LOGGER
+
     parser = argparse.ArgumentParser(description="Stream Pupper camera frames as MJPEG over HTTP.")
     parser.add_argument("--source", choices=["picamera", "ros-compressed"], default="picamera")
     parser.add_argument("--topic", default="/camera/image_raw/compressed")
@@ -162,7 +189,31 @@ def main():
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--jpeg-quality", type=int, default=75)
+    parser.add_argument("--session-id", default=os.environ.get("SESSION_ID"))
+    parser.add_argument("--trial-id", default=os.environ.get("TRIAL_ID", ""))
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=Path(os.environ.get("EXPERIMENT_LOG_DIR", ROOT_DIR / "data" / "experiments")),
+    )
+    parser.add_argument("--csv-log", type=Path, default=None)
     args = parser.parse_args()
+
+    EVENT_LOGGER = build_logger(
+        side="pupper",
+        component="camera_stream",
+        session_id=args.session_id,
+        trial_id=args.trial_id,
+        log_dir=args.log_dir,
+        csv_log=args.csv_log,
+    )
+    EVENT_LOGGER.log(
+        "stream_server_start",
+        stream_url=f"http://{args.host}:{args.port}/stream.mjpg",
+        image_width=args.width,
+        image_height=args.height,
+        notes=f"source={args.source}; topic={args.topic}; csv_log={EVENT_LOGGER.path}",
+    )
 
     if args.source == "picamera":
         source = threading.Thread(
@@ -192,6 +243,9 @@ def main():
         STOP_EVENT.set()
         server.server_close()
         source.join(timeout=2.0)
+        if EVENT_LOGGER is not None:
+            EVENT_LOGGER.log("stream_server_stop", frame_index=FRAME_STORE.frame_count)
+            EVENT_LOGGER.close()
 
 
 if __name__ == "__main__":

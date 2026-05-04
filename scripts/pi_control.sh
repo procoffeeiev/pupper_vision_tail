@@ -6,6 +6,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 POLICY_PATH="$PROJECT_ROOT/models/policy.json"
+SESSION_ID="${SESSION_ID:-pvt_$(date -u +%Y%m%dT%H%M%SZ)}"
+TRIAL_ID="${TRIAL_ID:-}"
+EXPERIMENT_LOG_DIR="${EXPERIMENT_LOG_DIR:-$PROJECT_ROOT/data/experiments}"
+CONDITION_DISTANCE_M="${CONDITION_DISTANCE_M:-}"
+GROUND_TRUTH_PERSON_PRESENT="${GROUND_TRUTH_PERSON_PRESENT:-unknown}"
+FINAL_DISTANCE_M="${FINAL_DISTANCE_M:-}"
 
 set +u
 if [[ -f /opt/ros/jazzy/setup.bash ]]; then
@@ -17,6 +23,7 @@ fi
 source ~/.bashrc
 set -u
 cd "$PROJECT_ROOT"
+mkdir -p "$EXPERIMENT_LOG_DIR"
 
 if [[ ! -f "$POLICY_PATH" ]]; then
     echo "Missing locomotion policy: $POLICY_PATH"
@@ -113,17 +120,31 @@ python3 "$PROJECT_ROOT/detr_person_detection/robot_camera_stream_server.py" \
     --source ros-compressed \
     --topic /camera/image_raw/compressed \
     --host 0.0.0.0 \
-    --port 8080 &
+    --port 8080 \
+    --session-id "$SESSION_ID" \
+    --trial-id "$TRIAL_ID" \
+    --log-dir "$EXPERIMENT_LOG_DIR" &
 STREAM_PID=$!
 sleep 1
 require_running "$STREAM_PID" "camera stream server"
 
-python3 "$PROJECT_ROOT/remote_detection_bridge.py" --host 0.0.0.0 --port 9999 &
+python3 "$PROJECT_ROOT/remote_detection_bridge.py" \
+    --host 0.0.0.0 \
+    --port 9999 \
+    --session-id "$SESSION_ID" \
+    --trial-id "$TRIAL_ID" \
+    --log-dir "$EXPERIMENT_LOG_DIR" &
 BRIDGE_PID=$!
 sleep 1
 require_running "$BRIDGE_PID" "detection bridge"
 
-python3 "$PROJECT_ROOT/main.py" &
+python3 "$PROJECT_ROOT/main.py" \
+    --session-id "$SESSION_ID" \
+    --trial-id "$TRIAL_ID" \
+    --log-dir "$EXPERIMENT_LOG_DIR" \
+    --condition-distance-m "$CONDITION_DISTANCE_M" \
+    --ground-truth-person-present "$GROUND_TRUTH_PERSON_PRESENT" \
+    --final-distance-m "$FINAL_DISTANCE_M" &
 MAIN_PID=$!
 sleep 1
 require_running "$MAIN_PID" "main loop"
@@ -134,6 +155,9 @@ if ! wait_for_url "http://127.0.0.1:8080/snapshot.jpg" 30; then
 fi
 
 echo "robot-side stack running"
+echo "session: $SESSION_ID"
+echo "trial: ${TRIAL_ID:-<unset>}"
+echo "experiment logs: $EXPERIMENT_LOG_DIR"
 echo "Ctrl+C stops ros2 launch, camera stream, detection bridge, and main.py cleanly"
 echo "camera stream ready at http://127.0.0.1:8080/stream.mjpg"
 
